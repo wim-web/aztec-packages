@@ -22,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <sys/types.h>
 #include <unordered_map>
 
@@ -66,7 +67,7 @@ WorldStateWrapper::WorldStateWrapper(const Napi::CallbackInfo& info)
         Napi::Object obj = info[tree_height_index].As<Napi::Object>();
 
         for (auto tree_id : tree_ids) {
-            if (obj.Has(tree_id)) {
+            if (obj.Has(std::to_string(tree_id))) {
                 tree_height[tree_id] = obj.Get(tree_id).As<Napi::Number>().Uint32Value();
             }
         }
@@ -79,7 +80,7 @@ WorldStateWrapper::WorldStateWrapper(const Napi::CallbackInfo& info)
         Napi::Object obj = info[tree_prefill_index].As<Napi::Object>();
 
         for (auto tree_id : tree_ids) {
-            if (obj.Has(tree_id)) {
+            if (obj.Has(std::to_string((tree_id)))) {
                 tree_prefill[tree_id] = obj.Get(tree_id).As<Napi::Number>().Uint32Value();
             }
         }
@@ -97,7 +98,7 @@ WorldStateWrapper::WorldStateWrapper(const Napi::CallbackInfo& info)
     // optional parameters
     size_t map_size_index = 4;
     if (info.Length() > map_size_index) {
-        if (info[4].IsObject()) {
+        if (info[map_size_index].IsObject()) {
             Napi::Object obj = info[map_size_index].As<Napi::Object>();
 
             for (auto tree_id : tree_ids) {

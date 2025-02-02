@@ -6,7 +6,15 @@ interface NativeClassCtor {
   new (...args: unknown[]): MessageReceiver;
 }
 
-const nativeModule: Record<string, NativeClassCtor> = bindings('nodejs_module');
+let nativeModule: Record<string, NativeClassCtor> = {};
+
+if ((process as any).isBun) {
+  let mod = { exports: {} };
+  (process as any).dlopen(mod, new URL(import.meta.resolve('../build/nodejs_module.node')).pathname);
+  nativeModule = mod.exports;
+} else {
+  nativeModule = bindings('nodejs_module');
+}
 
 export const NativeWorldState: NativeClassCtor = nativeModule.WorldState;
 export const NativeLMDBStore: NativeClassCtor = nativeModule.LMDBStore;
