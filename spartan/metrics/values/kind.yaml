@@ -64,7 +64,6 @@ loki:
       max_query_lookback: 24h
       max_query_length: 1h
       max_query_parallelism: 8
-      max_outstanding_per_tenant: 32
       query_timeout: 3m
   singleBinary:
     replicas: 1
