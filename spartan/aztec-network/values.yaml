@@ -111,7 +111,7 @@ validator:
     p2pTcpPort: 40400
     p2pUdpPort: 40400
     nodePort: 8080
-  logLevel: "debug; info: aztec:simulator, json-rpc"
+  logLevel: "debug; info: json-rpc"
   sequencer:
     maxSecondsBetweenBlocks: 0
     minTxsPerBlock: 1
@@ -151,7 +151,7 @@ proverNode:
     p2pTcpPort: 40400
     p2pUdpPort: 40400
     nodePort: 8080
-  logLevel: "debug; info: aztec:simulator, json-rpc"
+  logLevel: "debug; info: json-rpc"
   proverAgent:
     count: 0
     pollIntervalMs: 1000

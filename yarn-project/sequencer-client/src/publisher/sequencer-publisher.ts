@@ -185,7 +185,10 @@ export class SequencerPublisher {
       return undefined;
     }
     const currentL2Slot = this.getCurrentL2Slot();
-    this.log.debug(`Current L2 slot: ${currentL2Slot}`);
+    this.log.debug(`Current L2 slot: ${currentL2Slot}`, {
+      requestsCount: requestsToProcess.length,
+      trace: new Error().stack,
+    });
     const validRequests = requestsToProcess.filter(request => request.lastValidL2Slot >= currentL2Slot);
 
     if (validRequests.length !== requestsToProcess.length) {
