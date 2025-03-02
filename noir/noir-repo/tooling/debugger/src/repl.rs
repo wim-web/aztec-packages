@@ -1,13 +1,14 @@
 use crate::context::{DebugCommandResult, DebugContext, DebugLocation};
 
-use acvm::acir::brillig::{BitSize, IntegerBitSize};
+use acvm::acir::brillig::BitSize;
 use acvm::acir::circuit::brillig::{BrilligBytecode, BrilligFunctionId};
 use acvm::acir::circuit::{Circuit, Opcode, OpcodeLocation};
 use acvm::acir::native_types::{Witness, WitnessMap, WitnessStack};
 use acvm::brillig_vm::brillig::Opcode as BrilligOpcode;
 use acvm::brillig_vm::MemoryValue;
+use acvm::AcirField;
 use acvm::{BlackBoxFunctionSolver, FieldElement};
-use nargo::NargoError;
+use nargo::{NargoError, PrintOutput};
 use noirc_driver::CompiledProgram;
 
 use crate::foreign_calls::DefaultDebugForeignCallExecutor;
@@ -31,6 +32,10 @@ pub struct ReplDebugger<'a, B: BlackBoxFunctionSolver<FieldElement>> {
 
     // Brillig functions referenced from the ACIR circuits above
     unconstrained_functions: &'a [BrilligBytecode<FieldElement>],
+
+    // whether to print the source without highlighting, pretty-printing,
+    // or line numbers
+    raw_source_printing: bool,
 }
 
 impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
@@ -40,9 +45,12 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
         debug_artifact: &'a DebugArtifact,
         initial_witness: WitnessMap<FieldElement>,
         unconstrained_functions: &'a [BrilligBytecode<FieldElement>],
+        raw_source_printing: bool,
     ) -> Self {
-        let foreign_call_executor =
-            Box::new(DefaultDebugForeignCallExecutor::from_artifact(true, debug_artifact));
+        let foreign_call_executor = Box::new(DefaultDebugForeignCallExecutor::from_artifact(
+            PrintOutput::Stdout,
+            debug_artifact,
+        ));
         let context = DebugContext::new(
             blackbox_solver,
             circuits,
@@ -65,6 +73,7 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
             initial_witness,
             last_result,
             unconstrained_functions,
+            raw_source_printing,
         }
     }
 
@@ -94,7 +103,11 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
                     }
                 }
                 let locations = self.context.get_source_location_for_debug_location(&location);
-                print_source_code_location(self.debug_artifact, &locations);
+                print_source_code_location(
+                    self.debug_artifact,
+                    &locations,
+                    self.raw_source_printing,
+                );
             }
         }
     }
@@ -122,7 +135,7 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
             }
         }
         let locations = self.context.get_source_location_for_debug_location(debug_location);
-        print_source_code_location(self.debug_artifact, &locations);
+        print_source_code_location(self.debug_artifact, &locations, self.raw_source_printing);
     }
 
     pub fn show_current_call_stack(&self) {
@@ -230,6 +243,24 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
         }
     }
 
+    fn add_breakpoint_at_line(&mut self, line_number: i64) {
+        let Some(current_file) = self.context.get_current_file() else {
+            println!("No current file.");
+            return;
+        };
+
+        let best_location =
+            self.context.find_opcode_for_source_location(&current_file, line_number);
+
+        match best_location {
+            Some(location) => {
+                println!("Added breakpoint at line {}", line_number);
+                self.add_breakpoint_at(location)
+            }
+            None => println!("No opcode at line {}", line_number),
+        }
+    }
+
     fn delete_breakpoint_at(&mut self, location: DebugLocation) {
         if self.context.delete_breakpoint(&location) {
             println!("Breakpoint at {location} deleted");
@@ -312,8 +343,10 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
 
     fn restart_session(&mut self) {
         let breakpoints: Vec<DebugLocation> = self.context.iterate_breakpoints().copied().collect();
-        let foreign_call_executor =
-            Box::new(DefaultDebugForeignCallExecutor::from_artifact(true, self.debug_artifact));
+        let foreign_call_executor = Box::new(DefaultDebugForeignCallExecutor::from_artifact(
+            PrintOutput::Stdout,
+            self.debug_artifact,
+        ));
         self.context = DebugContext::new(
             self.blackbox_solver,
             self.circuits,
@@ -369,11 +402,13 @@ impl<'a, B: BlackBoxFunctionSolver<FieldElement>> ReplDebugger<'a, B> {
             return;
         };
 
-        for (index, value) in memory
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| !matches!(value, MemoryValue::Integer(_, IntegerBitSize::U0)))
-        {
+        for (index, value) in memory.iter().enumerate() {
+            // Zero field is the default value, we omit it when printing memory
+            if let MemoryValue::Field(field) = value {
+                if field == &FieldElement::zero() {
+                    continue;
+                }
+            }
             println!("{index} = {}", value);
         }
     }
@@ -420,6 +455,7 @@ pub fn run<B: BlackBoxFunctionSolver<FieldElement>>(
     blackbox_solver: &B,
     program: CompiledProgram,
     initial_witness: WitnessMap<FieldElement>,
+    raw_source_printing: bool,
 ) -> Result<Option<WitnessStack<FieldElement>>, NargoError<FieldElement>> {
     let circuits = &program.program.functions;
     let debug_artifact =
@@ -431,6 +467,7 @@ pub fn run<B: BlackBoxFunctionSolver<FieldElement>>(
         debug_artifact,
         initial_witness,
         unconstrained_functions,
+        raw_source_printing,
     ));
     let ref_context = &context;
 
@@ -513,6 +550,16 @@ pub fn run<B: BlackBoxFunctionSolver<FieldElement>>(
                 "display ACIR opcodes",
                 () => || {
                     ref_context.borrow().display_opcodes();
+                    Ok(CommandStatus::Done)
+                }
+            },
+        )
+        .add(
+            "break",
+            command! {
+                "add a breakpoint at a line of the current file",
+                (line_number: i64) => |line_number| {
+                    ref_context.borrow_mut().add_breakpoint_at_line(line_number);
                     Ok(CommandStatus::Done)
                 }
             },

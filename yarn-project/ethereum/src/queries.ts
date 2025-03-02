@@ -1,0 +1,58 @@
+import type { EthAddress } from '@aztec/foundation/eth-address';
+
+import type { L1ContractsConfig } from './config.js';
+import { GovernanceContract } from './contracts/governance.js';
+import { RollupContract } from './contracts/rollup.js';
+import type { ViemPublicClient } from './types.js';
+
+/** Reads the L1ContractsConfig from L1 contracts. */
+export async function getL1ContractsConfig(
+  publicClient: ViemPublicClient,
+  addresses: { governanceAddress: EthAddress; rollupAddress?: EthAddress },
+): Promise<Omit<L1ContractsConfig, 'ethereumSlotDuration'> & { l1StartBlock: bigint; l1GenesisTime: bigint }> {
+  const governance = new GovernanceContract(addresses.governanceAddress.toString(), publicClient, undefined);
+  const governanceProposer = await governance.getProposer();
+  const rollupAddress = addresses.rollupAddress ?? (await governance.getGovernanceAddresses()).rollupAddress;
+  const rollup = new RollupContract(publicClient, rollupAddress.toString());
+  const slasherProposer = await rollup.getSlashingProposer();
+
+  const [
+    l1StartBlock,
+    l1GenesisTime,
+    aztecEpochDuration,
+    aztecProofSubmissionWindow,
+    aztecSlotDuration,
+    aztecTargetCommitteeSize,
+    minimumStake,
+    governanceProposerQuorum,
+    governanceProposerRoundSize,
+    slashingQuorum,
+    slashingRoundSize,
+  ] = await Promise.all([
+    rollup.getL1StartBlock(),
+    rollup.getL1GenesisTime(),
+    rollup.getEpochDuration(),
+    rollup.getProofSubmissionWindow(),
+    rollup.getSlotDuration(),
+    rollup.getTargetCommitteeSize(),
+    rollup.getMinimumStake(),
+    governanceProposer.getQuorumSize(),
+    governanceProposer.getRoundSize(),
+    slasherProposer.getQuorumSize(),
+    slasherProposer.getRoundSize(),
+  ] as const);
+
+  return {
+    l1StartBlock,
+    l1GenesisTime,
+    aztecEpochDuration: Number(aztecEpochDuration),
+    aztecProofSubmissionWindow: Number(aztecProofSubmissionWindow),
+    aztecSlotDuration: Number(aztecSlotDuration),
+    aztecTargetCommitteeSize: Number(aztecTargetCommitteeSize),
+    governanceProposerQuorum: Number(governanceProposerQuorum),
+    governanceProposerRoundSize: Number(governanceProposerRoundSize),
+    minimumStake,
+    slashingQuorum: Number(slashingQuorum),
+    slashingRoundSize: Number(slashingRoundSize),
+  };
+}

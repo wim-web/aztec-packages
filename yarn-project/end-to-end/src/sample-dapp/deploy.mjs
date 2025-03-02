@@ -1,6 +1,9 @@
+// docs:start:deploy-imports
 import { getInitialTestAccountsWallets } from '@aztec/accounts/testing';
 import { Contract, createPXEClient, loadContractArtifact, waitForPXE } from '@aztec/aztec.js';
-import { TokenContract, TokenContractArtifact } from '@aztec/noir-contracts.js';
+// docs:end:deploy-imports
+import { TokenContractArtifact } from '@aztec/noir-contracts.js/Token';
+import { TokenContract } from '@aztec/noir-contracts.js/Token';
 
 import { writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -15,7 +18,9 @@ async function main() {
   const [ownerWallet] = await getInitialTestAccountsWallets(pxe);
   const ownerAddress = ownerWallet.getAddress();
 
-  const token = await TokenContract.deploy(ownerWallet, ownerAddress, 'TokenName', 'TKN', 18).send().deployed();
+  const token = await Contract.deploy(ownerWallet, TokenContractArtifact, [ownerAddress, 'TokenName', 'TKN', 18])
+    .send()
+    .deployed();
 
   console.log(`Token deployed at ${token.address.toString()}`);
 

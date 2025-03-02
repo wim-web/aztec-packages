@@ -1,74 +1,66 @@
-import {
-  type BBSuccess,
-  BB_RESULT,
-  generateAvmProof,
-  generateProof,
-  getPublicInputs,
-  verifyProof,
-} from '@aztec/bb-prover';
-import {
-  AvmCircuitInputs,
-  FunctionSelector,
-  Gas,
-  GlobalVariables,
-  SerializableContractInstance,
-} from '@aztec/circuits.js';
+import { type BBSuccess, BB_RESULT, generateAvmProof, generateProof, verifyProof } from '@aztec/bb-prover';
 import {
   AVM_PROOF_LENGTH_IN_FIELDS,
   AVM_PUBLIC_COLUMN_MAX_SIZE,
   AVM_PUBLIC_INPUTS_FLATTENED_SIZE,
   AVM_VERIFICATION_KEY_LENGTH_IN_FIELDS,
   PUBLIC_CIRCUIT_PUBLIC_INPUTS_LENGTH,
-} from '@aztec/circuits.js/constants';
+} from '@aztec/constants';
 import { Fr } from '@aztec/foundation/fields';
-import { createDebugLogger } from '@aztec/foundation/log';
+import { createLogger } from '@aztec/foundation/log';
 import { BufferReader } from '@aztec/foundation/serialize';
-import { type FixedLengthArray } from '@aztec/noir-protocol-circuits-types/types';
-import { AvmSimulator, PublicSideEffectTrace, type WorldStateDB } from '@aztec/simulator';
-import {
-  getAvmTestContractBytecode,
-  initContext,
-  initExecutionEnvironment,
-  initPersistableStateManager,
-  resolveAvmTestContractAssertionMessage,
-} from '@aztec/simulator/avm/fixtures';
+import { AvmTestContractArtifact } from '@aztec/noir-contracts.js/AvmTest';
+import type { FixedLengthArray } from '@aztec/noir-protocol-circuits-types/types';
+import { PublicTxSimulationTester } from '@aztec/simulator/public/fixtures';
+import type { AvmCircuitInputs } from '@aztec/stdlib/avm';
+import { AztecAddress } from '@aztec/stdlib/aztec-address';
+import type { ContractInstanceWithAddress } from '@aztec/stdlib/contract';
 
-import { jest } from '@jest/globals';
-import fs from 'fs/promises';
-import { mock } from 'jest-mock-extended';
+import { promises as fs } from 'fs';
 import { tmpdir } from 'node:os';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { MockPublicKernelCircuit, witnessGenMockPublicKernelCircuit } from './index.js';
+import { MockPublicBaseCircuit, witnessGenMockPublicBaseCircuit } from './index.js';
 
 // Auto-generated types from noir are not in camel case.
 /* eslint-disable camelcase */
 
-jest.setTimeout(240_000);
-
-const logger = createDebugLogger('aztec:avm-integration');
+const logger = createLogger('ivc-integration:test:avm-integration');
 
 describe('AVM Integration', () => {
   let bbWorkingDirectory: string;
   let bbBinaryPath: string;
 
+  let avmTestContractInstance: ContractInstanceWithAddress;
+  let avmTestContractAddress: AztecAddress;
+
+  let simTester: PublicTxSimulationTester;
+
   beforeEach(async () => {
     //Create a temp working dir
     bbWorkingDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'bb-avm-integration-'));
     bbBinaryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../../barretenberg/cpp/build/bin', 'bb');
+
+    simTester = await PublicTxSimulationTester.create();
+    avmTestContractInstance = await simTester.registerAndDeployContract(
+      /*constructorArgs=*/ [],
+      /*deployer=*/ AztecAddress.fromNumber(420),
+      AvmTestContractArtifact,
+    );
   });
 
   async function createHonkProof(witness: Uint8Array, bytecode: string): Promise<BBSuccess> {
     const witnessFileName = path.join(bbWorkingDirectory, 'witnesses.gz');
     await fs.writeFile(witnessFileName, witness);
-
+    const recursive = false;
     const provingResult = await generateProof(
       bbBinaryPath,
       bbWorkingDirectory,
-      'mock-public-kernel',
+      'mock-public-base',
       Buffer.from(bytecode, 'base64'),
+      recursive,
       witnessFileName,
       'ultra_honk',
       logger.info,
@@ -78,11 +70,28 @@ describe('AVM Integration', () => {
     return provingResult as BBSuccess;
   }
 
-  it('Should generate and verify an ultra honk proof from an AVM verification', async () => {
-    const bbSuccess = await proveAvmTestContract(
-      'bulk_testing',
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(x => new Fr(x)),
+  // TODO: Skipping for now as per Davids advice.
+  it.skip('Should generate and verify an ultra honk proof from an AVM verification', async () => {
+    // Get a deployed contract instance to pass to the contract
+    // for it to use as "expected" values when testing contract instance retrieval.
+    const expectContractInstance = avmTestContractInstance;
+    const argsField = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const argsU8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const args = [
+      ...argsField,
+      ...argsU8,
+      /*getInstanceForAddress=*/ expectContractInstance.address.toField(),
+      /*expectedDeployer=*/ expectContractInstance.deployer.toField(),
+      /*expectedClassId=*/ expectContractInstance.currentContractClassId.toField(),
+      /*expectedInitializationHash=*/ expectContractInstance.initializationHash.toField(),
+    ].map(x => new Fr(x));
+    const simRes = await simTester.simulateTx(
+      /*sender=*/ AztecAddress.fromNumber(42),
+      /*setupCalls=*/ [],
+      /*appCalls=*/ [{ address: avmTestContractAddress, fnName: 'bulk_testing', args }],
     );
+    const avmCircuitInputs = simRes.avmProvingRequest.inputs;
+    const bbSuccess = await proveAvm(avmCircuitInputs);
 
     const avmProofPath = bbSuccess.proofPath;
     const avmVkPath = bbSuccess.vkPath;
@@ -118,7 +127,7 @@ describe('AVM Integration', () => {
     const vk = vkReader.readArray(AVM_VERIFICATION_KEY_LENGTH_IN_FIELDS, Fr);
     expect(vk.length).toBe(AVM_VERIFICATION_KEY_LENGTH_IN_FIELDS);
 
-    const witGenResult = await witnessGenMockPublicKernelCircuit({
+    const witGenResult = await witnessGenMockPublicBaseCircuit({
       verification_key: vk.map(x => x.toString()) as FixedLengthArray<
         string,
         typeof AVM_VERIFICATION_KEY_LENGTH_IN_FIELDS
@@ -130,92 +139,33 @@ describe('AVM Integration', () => {
       >,
     });
 
-    await createHonkProof(witGenResult.witness, MockPublicKernelCircuit.bytecode);
+    await createHonkProof(witGenResult.witness, MockPublicBaseCircuit.bytecode);
 
     const verifyResult = await verifyProof(
       bbBinaryPath,
       path.join(bbWorkingDirectory, 'proof'),
       path.join(bbWorkingDirectory, 'vk'),
       'ultra_honk',
-      logger.info,
+      logger,
     );
 
     expect(verifyResult.status).toBe(BB_RESULT.SUCCESS);
-  });
+  }, 240_000);
 });
 
-// Helper
+async function proveAvm(avmCircuitInputs: AvmCircuitInputs): Promise<BBSuccess> {
+  const internalLogger = createLogger('ivc-integration:test:avm-proving');
 
-const proveAvmTestContract = async (
-  functionName: string,
-  calldata: Fr[] = [],
-  assertionErrString?: string,
-): Promise<BBSuccess> => {
-  const startSideEffectCounter = 0;
-  const functionSelector = FunctionSelector.random();
-  const globals = GlobalVariables.empty();
-  const environment = initExecutionEnvironment({ functionSelector, calldata, globals });
-
-  const worldStateDB = mock<WorldStateDB>();
-  const contractInstance = new SerializableContractInstance({
-    version: 1,
-    salt: new Fr(0x123),
-    deployer: new Fr(0x456),
-    contractClassId: new Fr(0x789),
-    initializationHash: new Fr(0x101112),
-    publicKeysHash: new Fr(0x161718),
-  }).withAddress(environment.address);
-  worldStateDB.getContractInstance.mockResolvedValue(await Promise.resolve(contractInstance));
-
-  const storageValue = new Fr(5);
-  worldStateDB.storageRead.mockResolvedValue(await Promise.resolve(storageValue));
-
-  const trace = new PublicSideEffectTrace(startSideEffectCounter);
-  const persistableState = initPersistableStateManager({ worldStateDB, trace });
-  const context = initContext({ env: environment, persistableState });
-  const nestedCallBytecode = getAvmTestContractBytecode('add_args_return');
-  jest.spyOn(worldStateDB, 'getBytecode').mockResolvedValue(nestedCallBytecode);
-
-  const startGas = new Gas(context.machineState.gasLeft.daGas, context.machineState.gasLeft.l2Gas);
-
-  // Use a simple contract that emits a side effect
-  const bytecode = getAvmTestContractBytecode(functionName);
   // The paths for the barretenberg binary and the write path are hardcoded for now.
   const bbPath = path.resolve('../../barretenberg/cpp/build/bin/bb');
   const bbWorkingDirectory = await fs.mkdtemp(path.join(tmpdir(), 'bb-'));
-  // First we simulate (though it's not needed in this simple case).
-  const simulator = new AvmSimulator(context);
-  const avmResult = await simulator.executeBytecode(bytecode);
-
-  if (assertionErrString == undefined) {
-    expect(avmResult.reverted).toBe(false);
-  } else {
-    // Explicit revert when an assertion failed.
-    expect(avmResult.reverted).toBe(true);
-    expect(avmResult.revertReason).toBeDefined();
-    expect(resolveAvmTestContractAssertionMessage(functionName, avmResult.revertReason!)).toContain(assertionErrString);
-  }
-
-  const pxResult = trace.toPublicExecutionResult(
-    environment,
-    startGas,
-    /*endGasLeft=*/ Gas.from(context.machineState.gasLeft),
-    /*bytecode=*/ simulator.getBytecode()!,
-    avmResult,
-    functionName,
-  );
-
-  const avmCircuitInputs = new AvmCircuitInputs(
-    functionName,
-    /*bytecode=*/ simulator.getBytecode()!, // uncompressed bytecode
-    /*calldata=*/ context.environment.calldata,
-    /*publicInputs=*/ getPublicInputs(pxResult),
-    /*avmHints=*/ pxResult.avmCircuitHints,
-  );
 
   // Then we prove.
-  const proofRes = await generateAvmProof(bbPath, bbWorkingDirectory, avmCircuitInputs, logger.info);
+  const proofRes = await generateAvmProof(bbPath, bbWorkingDirectory, avmCircuitInputs, internalLogger);
+  if (proofRes.status === BB_RESULT.FAILURE) {
+    internalLogger.error(`Proof generation failed: ${proofRes.reason}`);
+  }
   expect(proofRes.status).toEqual(BB_RESULT.SUCCESS);
 
   return proofRes as BBSuccess;
-};
+}

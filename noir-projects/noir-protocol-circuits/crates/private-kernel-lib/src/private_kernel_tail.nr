@@ -1,21 +1,19 @@
 use crate::components::{
     previous_kernel_validator::PreviousKernelValidator, tail_output_composer::TailOutputComposer,
-    tail_output_validator::TailOutputValidator
+    tail_output_validator::TailOutputValidator,
 };
 use dep::types::{
     abis::{
-    private_kernel_data::{PrivateKernelData, PrivateKernelDataWithoutPublicInputs},
-    kernel_circuit_public_inputs::KernelCircuitPublicInputs
-},
+        kernel_circuit_public_inputs::PrivateToRollupKernelCircuitPublicInputs,
+        private_kernel_data::{PrivateKernelData, PrivateKernelDataWithoutPublicInputs},
+    },
     constants::{PRIVATE_KERNEL_INIT_INDEX, PRIVATE_KERNEL_INNER_INDEX, PRIVATE_KERNEL_RESET_INDEX},
-    PrivateKernelCircuitPublicInputs
+    PrivateKernelCircuitPublicInputs,
+    proof::traits::Verifiable,
 };
 
-global ALLOWED_PREVIOUS_CIRCUITS = [
-    PRIVATE_KERNEL_INIT_INDEX,
-    PRIVATE_KERNEL_INNER_INDEX,
-    PRIVATE_KERNEL_RESET_INDEX,
-];
+global ALLOWED_PREVIOUS_CIRCUITS: [u32; 3] =
+    [PRIVATE_KERNEL_INIT_INDEX, PRIVATE_KERNEL_INNER_INDEX, PRIVATE_KERNEL_RESET_INDEX];
 
 pub struct PrivateKernelTailCircuitPrivateInputs {
     previous_kernel: PrivateKernelData,
@@ -24,20 +22,24 @@ pub struct PrivateKernelTailCircuitPrivateInputs {
 impl PrivateKernelTailCircuitPrivateInputs {
     pub fn new(
         previous_kernel: PrivateKernelDataWithoutPublicInputs,
-        previous_kernel_public_inputs: PrivateKernelCircuitPublicInputs
+        previous_kernel_public_inputs: PrivateKernelCircuitPublicInputs,
     ) -> Self {
-        Self { previous_kernel: previous_kernel.to_private_kernel_data(previous_kernel_public_inputs) }
+        Self {
+            previous_kernel: previous_kernel.to_private_kernel_data(previous_kernel_public_inputs),
+        }
     }
 
-    unconstrained fn generate_output(self) -> KernelCircuitPublicInputs {
+    unconstrained fn generate_output(self) -> PrivateToRollupKernelCircuitPublicInputs {
         TailOutputComposer::new(self.previous_kernel.public_inputs).finish()
     }
 
-    pub fn execute(self) -> KernelCircuitPublicInputs {
+    pub fn execute(self) -> PrivateToRollupKernelCircuitPublicInputs {
+        if !std::runtime::is_unconstrained() {
+            self.previous_kernel.verify();
+        }
         // Generate output.
-        let output = unsafe {
-            self.generate_output()
-        };
+        // Safety: The output is validated below by TailOutputValidator.
+        let output = unsafe { self.generate_output() };
 
         // Validate inputs.
         let previous_kernel_validator = PreviousKernelValidator::new(self.previous_kernel);
@@ -54,18 +56,24 @@ impl PrivateKernelTailCircuitPrivateInputs {
 }
 
 mod tests {
-    use crate::private_kernel_tail::{PrivateKernelTailCircuitPrivateInputs, ALLOWED_PREVIOUS_CIRCUITS};
-    use dep::types::constants::{
-        DA_BYTES_PER_FIELD, DA_GAS_PER_BYTE, GENERATOR_INDEX__IVSK_M, L2_GAS_PER_LOG_BYTE,
-        L2_GAS_PER_NULLIFIER, PRIVATE_KERNEL_INNER_INDEX
+    use crate::private_kernel_tail::{
+        ALLOWED_PREVIOUS_CIRCUITS, PrivateKernelTailCircuitPrivateInputs,
     };
     use dep::types::{
         abis::{
-        kernel_circuit_public_inputs::KernelCircuitPublicInputs, max_block_number::MaxBlockNumber,
-        gas::Gas, log_hash::ScopedLogHash
-    },
-        address::{AztecAddress, EthAddress}, tests::fixture_builder::FixtureBuilder, traits::is_empty,
-        point::Point
+            gas::Gas, kernel_circuit_public_inputs::PrivateToRollupKernelCircuitPublicInputs,
+            max_block_number::MaxBlockNumber,
+        },
+        address::{AztecAddress, EthAddress},
+        messaging::l2_to_l1_message::ScopedL2ToL1Message,
+        point::Point,
+        tests::fixture_builder::FixtureBuilder,
+        traits::{Empty, FromField},
+    };
+    use dep::types::constants::{
+        DA_BYTES_PER_FIELD, DA_GAS_PER_BYTE, GENERATOR_INDEX__IVSK_M, L2_GAS_PER_CONTRACT_CLASS_LOG,
+        L2_GAS_PER_L2_TO_L1_MSG, L2_GAS_PER_NULLIFIER, L2_GAS_PER_PRIVATE_LOG,
+        PRIVATE_KERNEL_INNER_INDEX, PRIVATE_KERNEL_TAIL_INDEX, PRIVATE_LOG_SIZE_IN_FIELDS,
     };
 
     // TODO: Reduce the duplicated code/tests for PrivateKernelTailInputs and PrivateKernelTailToPublicInputs.
@@ -77,13 +85,17 @@ mod tests {
         pub fn new() -> Self {
             let mut previous_kernel = FixtureBuilder::new().in_vk_tree(PRIVATE_KERNEL_INNER_INDEX);
             previous_kernel.tx_context.gas_settings.gas_limits = Gas::new(1_000_000, 1_000_000);
-            previous_kernel.set_first_nullifier();
+            previous_kernel.set_protocol_nullifier();
+            previous_kernel.set_fee_payer(AztecAddress::from_field(234234));
+            previous_kernel.is_private_only = true;
 
             PrivateKernelTailInputsBuilder { previous_kernel }
         }
 
-        pub fn execute(&mut self) -> KernelCircuitPublicInputs {
-            let kernel = PrivateKernelTailCircuitPrivateInputs { previous_kernel: self.previous_kernel.to_private_kernel_data() };
+        pub fn execute(&mut self) -> PrivateToRollupKernelCircuitPublicInputs {
+            let kernel = PrivateKernelTailCircuitPrivateInputs {
+                previous_kernel: self.previous_kernel.to_private_kernel_data(),
+            };
             kernel.execute()
         }
 
@@ -99,9 +111,7 @@ mod tests {
     #[test]
     fn execution_succeeded() {
         let mut builder = PrivateKernelTailInputsBuilder::new();
-        let public_inputs = builder.execute();
-
-        assert(is_empty(public_inputs.start_state));
+        let _public_inputs = builder.execute();
     }
 
     #[test]
@@ -114,56 +124,26 @@ mod tests {
     }
 
     #[test]
-    fn measuring_of_log_lengths() {
-        let mut builder = PrivateKernelTailInputsBuilder::new();
-        // Logs for the previous call stack.
-        let prev_encrypted_logs_hash = 80;
-        let prev_encrypted_log_preimages_length = 13;
-        let prev_unencrypted_logs_hash = 956;
-        let prev_unencrypted_log_preimages_length = 24;
-        builder.previous_kernel.add_masked_encrypted_log_hash(prev_encrypted_logs_hash, prev_encrypted_log_preimages_length);
-        builder.previous_kernel.add_unencrypted_log_hash(
-            prev_unencrypted_logs_hash,
-            prev_unencrypted_log_preimages_length
-        );
-        // Logs for the current call stack.
-        let unencrypted_logs_hash = 26;
-        let unencrypted_log_preimages_length = 50;
-        builder.previous_kernel.add_unencrypted_log_hash(unencrypted_logs_hash, unencrypted_log_preimages_length);
-
-        let public_inputs = builder.execute();
-
-        assert_eq(public_inputs.end.encrypted_log_preimages_length, prev_encrypted_log_preimages_length);
-        assert_eq(
-            public_inputs.end.unencrypted_log_preimages_length, unencrypted_log_preimages_length + prev_unencrypted_log_preimages_length
-        );
-    }
-
-    #[test]
-    fn ordering_of_unencrypted_logs() {
+    fn ordering_of_msgs() {
         let mut builder = PrivateKernelTailInputsBuilder::new();
 
-        builder.previous_kernel.append_unencrypted_log_hashes(2);
+        builder.previous_kernel.append_l2_to_l1_msgs(2);
 
-        // Reorder the logs
-        let original_logs = builder.previous_kernel.unencrypted_logs_hashes.storage;
-        let mut reversed_logs = [ScopedLogHash::empty(); 2];
-        for i in 0..reversed_logs.len() {
-            reversed_logs[i] = builder.previous_kernel.unencrypted_logs_hashes.pop();
+        // Reorder the msgs
+        let original_msgs = builder.previous_kernel.l2_to_l1_msgs.storage();
+        let mut reversed_msgs = [ScopedL2ToL1Message::empty(); 2];
+        for i in 0..reversed_msgs.len() {
+            reversed_msgs[i] = builder.previous_kernel.l2_to_l1_msgs.pop();
         }
-        builder.previous_kernel.unencrypted_logs_hashes.extend_from_array(reversed_logs);
+        builder.previous_kernel.l2_to_l1_msgs.extend_from_array(reversed_msgs);
 
         let public_inputs = builder.execute();
 
-        let resulting_encrypted_logs = public_inputs.end.unencrypted_logs_hashes;
+        let resulting_msgs = public_inputs.end.l2_to_l1_msgs;
 
         assert_eq(
-            resulting_encrypted_logs, original_logs.map(
-                |mut log: ScopedLogHash| {
-               log.log_hash.counter = 0;
-               log
-            }
-            )
+            resulting_msgs,
+            original_msgs.map(|mut msg: ScopedL2ToL1Message| msg.expose_to_public()),
         );
     }
 
@@ -217,26 +197,35 @@ mod tests {
         let _void = builder.previous_kernel.add_request_for_key_validation(
             Point { x: 1, y: 2, is_infinite: false },
             27,
-            GENERATOR_INDEX__IVSK_M as Field
+            GENERATOR_INDEX__IVSK_M as Field,
         );
         builder.failed();
     }
 
+    #[test(should_fail_with = "First nullifier claim was not satisfied")]
+    fn first_nullifier_validation() {
+        let mut builder = PrivateKernelTailInputsBuilder::new();
+        let mut first_nullifier = builder.previous_kernel.nullifiers.get(0);
+        first_nullifier.nullifier.value += 1;
+        builder.previous_kernel.nullifiers.set(0, first_nullifier);
+        builder.failed();
+    }
+
     #[test]
-    fn empty_tx_consumes_teardown_limits_plus_fixed_gas() {
+    fn empty_tx_consumes_fixed_gas() {
         let mut builder = PrivateKernelTailInputsBuilder::new();
         builder.previous_kernel.tx_context.gas_settings.teardown_gas_limits = Gas::new(300, 300);
         let public_inputs = builder.execute();
 
         // addition follows the form:
-        // teardown gas
         // tx overhead
         // tx nullifier (which has DA and L2 gas)
-        let expected_gas_consumed = Gas::new(300, 300) + Gas::tx_overhead() + Gas::new(
-                    DA_GAS_PER_BYTE * DA_BYTES_PER_FIELD * 1,
-                    L2_GAS_PER_NULLIFIER * 1
-                );
-        assert_eq(public_inputs.end.gas_used, expected_gas_consumed);
+        let expected_gas_consumed = Gas::tx_overhead()
+            + Gas::new(
+                DA_GAS_PER_BYTE * DA_BYTES_PER_FIELD * 1,
+                L2_GAS_PER_NULLIFIER * 1,
+            );
+        assert_eq(public_inputs.gas_used, expected_gas_consumed);
     }
 
     #[test]
@@ -251,31 +240,35 @@ mod tests {
         let public_inputs = builder.execute();
 
         assert_eq(
-            Gas::tx_overhead() + Gas::new(
-                4 * DA_BYTES_PER_FIELD * DA_GAS_PER_BYTE,
-                1 * L2_GAS_PER_NULLIFIER
-            ), public_inputs.end.gas_used
+            Gas::tx_overhead()
+                + Gas::new(
+                    4 * DA_BYTES_PER_FIELD * DA_GAS_PER_BYTE,
+                    1 * L2_GAS_PER_NULLIFIER + 3 * L2_GAS_PER_L2_TO_L1_MSG,
+                ),
+            public_inputs.gas_used,
         );
     }
 
     #[test]
     unconstrained fn tx_consumed_gas_from_logs() {
         let mut builder = PrivateKernelTailInputsBuilder::new();
-        builder.previous_kernel.add_masked_encrypted_log_hash(42, 3);
-        builder.previous_kernel.add_masked_encrypted_log_hash(42, 4);
-        builder.previous_kernel.add_unencrypted_log_hash(42, 5);
+        builder.previous_kernel.append_siloed_private_logs_for_note(1, 33);
+        builder.previous_kernel.add_contract_class_log_hash(999, 12);
         builder.previous_kernel.end_setup();
-        builder.previous_kernel.add_masked_encrypted_log_hash(42, 6);
-        builder.previous_kernel.add_unencrypted_log_hash(42, 7);
+        builder.previous_kernel.append_siloed_private_logs_for_note(2, 44);
 
         let public_inputs = builder.execute();
 
-        assert_eq(
-            Gas::tx_overhead() + Gas::new(
-                (1 * DA_BYTES_PER_FIELD + 25) * DA_GAS_PER_BYTE ,
-                1 * L2_GAS_PER_NULLIFIER + 25 * L2_GAS_PER_LOG_BYTE
-            ), public_inputs.end.gas_used
-        );
+        let num_private_logs = 1 + 2;
+        let num_da_fields = 1 /* nullifier */
+            + num_private_logs * PRIVATE_LOG_SIZE_IN_FIELDS
+            + 1 * 12 /* contract_class_logs */;
+        let num_da_bytes = (num_da_fields * DA_BYTES_PER_FIELD);
+        let da_gas = num_da_bytes * DA_GAS_PER_BYTE;
+        let l2_gas = 1 * L2_GAS_PER_NULLIFIER
+            + num_private_logs * L2_GAS_PER_PRIVATE_LOG
+            + 1 * L2_GAS_PER_CONTRACT_CLASS_LOG;
+        assert_eq(Gas::tx_overhead() + Gas::new(da_gas, l2_gas), public_inputs.gas_used);
     }
 
     #[test(should_fail_with = "The gas used exceeds the gas limits")]
@@ -287,34 +280,20 @@ mod tests {
     }
 
     #[test]
-    fn propagate_fee_payer() {
-        // Check that we carry forward if the fee payer is already set
-        let mut builder = PrivateKernelTailInputsBuilder::new();
-        let fee_payer = AztecAddress::from_field(123);
-        builder.previous_kernel.fee_payer = fee_payer;
-        let public_inputs = builder.execute();
-        assert_eq(public_inputs.fee_payer, fee_payer);
-
-        // Check that the fee payer remains empty if unset
-        let mut builder = PrivateKernelTailInputsBuilder::new();
-        let public_inputs = builder.execute();
-        assert_eq(public_inputs.fee_payer, AztecAddress::empty());
-    }
-
-    #[test]
     fn valid_previous_kernel() {
         for i in 0..ALLOWED_PREVIOUS_CIRCUITS.len() {
             let mut builder = PrivateKernelTailInputsBuilder::new();
-            builder.previous_kernel = builder.previous_kernel.in_vk_tree(ALLOWED_PREVIOUS_CIRCUITS[i]);
+            builder.previous_kernel =
+                builder.previous_kernel.in_vk_tree(ALLOWED_PREVIOUS_CIRCUITS[i]);
 
             let _res = builder.execute();
         }
     }
-    // TODO(#7410) we need the tube vk to reinstate this
-    // #[test(should_fail_with="Invalid vk index")]
-    // fn invalid_previous_kernel() {
-    //     let mut builder = PrivateKernelTailInputsBuilder::new();
-    //     builder.previous_kernel = builder.previous_kernel.in_vk_tree(BASE_ROLLUP_INDEX);
-    //     let _res = builder.execute();
-    // }
+
+    #[test(should_fail_with = "Invalid vk index")]
+    fn invalid_previous_kernel() {
+        let mut builder = PrivateKernelTailInputsBuilder::new();
+        builder.previous_kernel = builder.previous_kernel.in_vk_tree(PRIVATE_KERNEL_TAIL_INDEX);
+        let _res = builder.execute();
+    }
 }

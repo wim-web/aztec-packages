@@ -1,15 +1,15 @@
-import { type Fr } from '@aztec/circuits.js';
 import {
   type ContractArtifact,
   type FunctionArtifact,
   FunctionSelector,
   encodeArguments,
-  getFunctionArtifact,
-} from '@aztec/foundation/abi';
+  getFunctionArtifactByName,
+} from '@aztec/stdlib/abi';
+import type { PublicKeys } from '@aztec/stdlib/keys';
 
-import { type AuthWitnessProvider } from '../account/interface.js';
-import { type Wallet } from '../account/wallet.js';
-import { type ExecutionRequestInit } from '../api/entrypoint.js';
+import type { AuthWitnessProvider } from '../account/interface.js';
+import type { Wallet } from '../account/wallet.js';
+import type { ExecutionRequestInit } from '../api/entrypoint.js';
 import { Contract } from '../contract/contract.js';
 import { DeployMethod, type DeployOptions } from '../contract/deploy_method.js';
 import { EntrypointPayload, computeCombinedPayloadHash } from '../entrypoint/payload.js';
@@ -23,7 +23,7 @@ export class DeployAccountMethod extends DeployMethod {
 
   constructor(
     authWitnessProvider: AuthWitnessProvider,
-    publicKeysHash: Fr,
+    publicKeys: PublicKeys,
     wallet: Wallet,
     artifact: ContractArtifact,
     args: any[] = [],
@@ -31,7 +31,7 @@ export class DeployAccountMethod extends DeployMethod {
     feePaymentNameOrArtifact?: string | FunctionArtifact,
   ) {
     super(
-      publicKeysHash,
+      publicKeys,
       wallet,
       artifact,
       (address, wallet) => Contract.at(address, artifact, wallet),
@@ -42,23 +42,26 @@ export class DeployAccountMethod extends DeployMethod {
     this.#authWitnessProvider = authWitnessProvider;
     this.#feePaymentArtifact =
       typeof feePaymentNameOrArtifact === 'string'
-        ? getFunctionArtifact(artifact, feePaymentNameOrArtifact)
+        ? getFunctionArtifactByName(artifact, feePaymentNameOrArtifact)
         : feePaymentNameOrArtifact;
   }
 
-  protected override async getInitializeFunctionCalls(options: DeployOptions): Promise<ExecutionRequestInit> {
+  protected override async getInitializeFunctionCalls(
+    options: DeployOptions,
+  ): Promise<Pick<ExecutionRequestInit, 'calls' | 'authWitnesses' | 'hashedArguments'>> {
     const exec = await super.getInitializeFunctionCalls(options);
 
     if (options.fee && this.#feePaymentArtifact) {
-      const { address } = this.getInstance();
-      const emptyAppPayload = EntrypointPayload.fromAppExecution([]);
-      const feePayload = await EntrypointPayload.fromFeeOptions(address, options?.fee);
+      const { address } = await this.getInstance();
+      const emptyAppPayload = await EntrypointPayload.fromAppExecution([]);
+      const fee = await this.getDefaultFeeOptions(options.fee);
+      const feePayload = await EntrypointPayload.fromFeeOptions(address, fee);
 
       exec.calls.push({
         name: this.#feePaymentArtifact.name,
         to: address,
         args: encodeArguments(this.#feePaymentArtifact, [emptyAppPayload, feePayload, false]),
-        selector: FunctionSelector.fromNameAndParameters(
+        selector: await FunctionSelector.fromNameAndParameters(
           this.#feePaymentArtifact.name,
           this.#feePaymentArtifact.parameters,
         ),
@@ -68,14 +71,14 @@ export class DeployAccountMethod extends DeployMethod {
       });
 
       exec.authWitnesses ??= [];
-      exec.packedArguments ??= [];
+      exec.hashedArguments ??= [];
 
       exec.authWitnesses.push(
-        await this.#authWitnessProvider.createAuthWit(computeCombinedPayloadHash(emptyAppPayload, feePayload)),
+        await this.#authWitnessProvider.createAuthWit(await computeCombinedPayloadHash(emptyAppPayload, feePayload)),
       );
 
-      exec.packedArguments.push(...emptyAppPayload.packedArguments);
-      exec.packedArguments.push(...feePayload.packedArguments);
+      exec.hashedArguments.push(...emptyAppPayload.hashedArguments);
+      exec.hashedArguments.push(...feePayload.hashedArguments);
     }
 
     return exec;

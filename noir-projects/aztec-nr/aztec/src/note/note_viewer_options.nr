@@ -1,27 +1,30 @@
-use std::option::Option;
-use crate::note::note_getter_options::{PropertySelector, Select, Sort, NoteStatus};
-use dep::protocol_types::traits::ToField;
-use crate::note::note_interface::NoteInterface;
 use crate::note::constants::MAX_NOTES_PER_PAGE;
+use crate::note::note_getter_options::{NoteStatus, PropertySelector, Select, Sort};
+use crate::note::note_interface::NoteType;
+use dep::protocol_types::traits::{Packable, ToField};
+use std::option::Option;
 
 // docs:start:NoteViewerOptions
 pub struct NoteViewerOptions<Note, let N: u32> {
-    selects: BoundedVec<Option<Select>, N>,
-    sorts: BoundedVec<Option<Sort>, N>,
-    limit: u32,
-    offset: u32,
-    status: u8,
+    pub selects: BoundedVec<Option<Select>, N>,
+    pub sorts: BoundedVec<Option<Sort>, N>,
+    pub limit: u32,
+    pub offset: u32,
+    pub status: u8,
 }
 // docs:end:NoteViewerOptions
 
 impl<Note, let N: u32> NoteViewerOptions<Note, N> {
-    pub fn new() -> NoteViewerOptions<Note, N> where Note: NoteInterface<N> {
+    pub fn new() -> NoteViewerOptions<Note, N>
+    where
+        Note: NoteType + Packable<N>,
+    {
         NoteViewerOptions {
             selects: BoundedVec::new(),
             sorts: BoundedVec::new(),
             limit: MAX_NOTES_PER_PAGE as u32,
             offset: 0,
-            status: NoteStatus.ACTIVE
+            status: NoteStatus.ACTIVE,
         }
     }
 
@@ -33,8 +36,11 @@ impl<Note, let N: u32> NoteViewerOptions<Note, N> {
         &mut self,
         property_selector: PropertySelector,
         comparator: u8,
-        value: T
-    ) -> Self where T: ToField {
+        value: T,
+    ) -> Self
+    where
+        T: ToField,
+    {
         self.selects.push(Option::some(Select::new(property_selector, comparator, value.to_field())));
         *self
     }

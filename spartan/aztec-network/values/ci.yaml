@@ -1,0 +1,81 @@
+aztec:
+  slotDuration: 24
+  epochDuration: 4
+  proofSubmissionWindow: 8
+
+ethereum:
+  blockTime: 8
+  execution:
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "200m"
+  beacon:
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "200m"
+  validator:
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "200m"
+
+telemetry:
+  enabled: true
+
+validator:
+  replicas: 8
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+  validator:
+    disabled: false
+  sequencer:
+    enforceTimeTable: false
+
+fullNode:
+  replicas: 1
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "200m"
+
+bot:
+  followChain: "PENDING"
+  enabled: true
+  txIntervalSeconds: 1
+
+bootNode:
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "200m"
+
+proverAgent:
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "200m"
+
+proverBroker:
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "200m"
+
+proverNode:
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "200m"

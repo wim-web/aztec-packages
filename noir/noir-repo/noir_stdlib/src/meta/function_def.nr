@@ -4,6 +4,11 @@ impl FunctionDefinition {
     pub comptime fn add_attribute<let N: u32>(self, attribute: str<N>) {}
     // docs:end:add_attribute
 
+    #[builtin(function_def_as_typed_expr)]
+    // docs:start:as_typed_expr
+    pub comptime fn as_typed_expr(self) -> TypedExpr {}
+    // docs:end:as_typed_expr
+
     #[builtin(function_def_body)]
     // docs:start:body
     pub comptime fn body(self) -> Expr {}
@@ -69,7 +74,10 @@ impl FunctionDefinition {
 }
 
 impl crate::hash::Hash for FunctionDefinition {
-    comptime fn hash<H>(self, state: &mut H) where H: crate::hash::Hasher {
+    comptime fn hash<H>(self, state: &mut H)
+    where
+        H: crate::hash::Hasher,
+    {
         state.write(function_def_hash(self))
     }
 }

@@ -5,18 +5,23 @@ use std::{
     rc::Rc,
 };
 
+#[cfg(test)]
+use proptest_derive::Arbitrary;
+
+use acvm::{AcirField, FieldElement};
+
 use crate::{
-    ast::IntegerBitSize,
+    ast::{IntegerBitSize, ItemVisibility},
     hir::type_check::{generics::TraitGenerics, TypeCheckError},
     node_interner::{ExprId, NodeInterner, TraitId, TypeAliasId},
 };
 use iter_extended::vecmap;
-use noirc_errors::{Location, Span};
+use noirc_errors::Location;
 use noirc_printable_type::PrintableType;
 
 use crate::{
     ast::{Ident, Signedness},
-    node_interner::StructId,
+    node_interner::TypeId,
 };
 
 use super::{
@@ -62,7 +67,7 @@ pub enum Type {
     /// A user-defined struct type. The `Shared<StructType>` field here refers to
     /// the shared definition for each instance of this struct type. The `Vec<Type>`
     /// represents the generic arguments (if any) to this struct type.
-    Struct(Shared<StructType>, Vec<Type>),
+    DataType(Shared<DataType>, Vec<Type>),
 
     /// A user-defined alias to another type. Similar to a Struct, this carries a shared
     /// reference to the definition of the alias along with any generics that may have
@@ -89,6 +94,11 @@ pub enum Type {
     /// like `fn foo<T, U>(...) {}`. Unlike TypeVariables, they cannot be bound over.
     NamedGeneric(TypeVariable, Rc<String>),
 
+    /// A cast (to, from) that's checked at monomorphization.
+    ///
+    /// Simplifications on arithmetic generics are only allowed on the LHS.
+    CheckedCast { from: Box<Type>, to: Box<Type> },
+
     /// A functions with arguments, a return type and environment.
     /// the environment should be `Unit` by default,
     /// for closures it should contain a `Tuple` type with the captured
@@ -110,14 +120,22 @@ pub enum Type {
     /// will be and thus needs the full TypeVariable link.
     Forall(GenericTypeVars, Box<Type>),
 
-    /// A type-level integer. Included to let an Array's size type variable
-    /// bind to an integer without special checks to bind it to a non-type.
-    Constant(u32, Kind),
+    /// A type-level integer. Included to let
+    /// 1. an Array's size type variable
+    ///     bind to an integer without special checks to bind it to a non-type.
+    /// 2. values to be used at the type level
+    Constant(FieldElement, Kind),
 
     /// The type of quoted code in macros. This is always a comptime-only type
     Quoted(QuotedType),
 
-    InfixExpr(Box<Type>, BinaryTypeOperator, Box<Type>),
+    /// An infix expression in the form `lhs * rhs`.
+    ///
+    /// The `inversion` bool keeps track of whether this expression came from
+    /// an expression like `4 = a / b` which was transformed to `a = 4 / b`
+    /// so that if at some point a infix expression `b * (4 / b)` is created,
+    /// it could be simplified back to `4`.
+    InfixExpr(Box<Type>, BinaryTypeOperator, Box<Type>, bool /* inversion */),
 
     /// The result of some type error. Remembering type errors as their own type variant lets
     /// us avoid issuing repeat type errors for the same item. For example, a lambda with
@@ -157,19 +175,35 @@ pub enum Kind {
 }
 
 impl Kind {
+    // Kind::Numeric constructor helper
+    pub fn numeric(typ: Type) -> Kind {
+        Kind::Numeric(Box::new(typ))
+    }
+
     pub(crate) fn is_error(&self) -> bool {
-        match self {
-            Self::Numeric(typ) => **typ == Type::Error,
+        match self.follow_bindings() {
+            Self::Numeric(typ) => *typ == Type::Error,
             _ => false,
         }
     }
 
-    pub(crate) fn is_numeric(&self) -> bool {
-        matches!(self, Self::Numeric { .. })
+    pub(crate) fn is_type_level_field_element(&self) -> bool {
+        let type_level = false;
+        self.is_field_element(type_level)
+    }
+
+    /// If value_level, only check for Type::FieldElement,
+    /// else only check for a type-level FieldElement
+    fn is_field_element(&self, value_level: bool) -> bool {
+        match self.follow_bindings() {
+            Kind::Numeric(typ) => typ.is_field_element(value_level),
+            Kind::IntegerOrField => value_level,
+            _ => false,
+        }
     }
 
     pub(crate) fn u32() -> Self {
-        Self::Numeric(Box::new(Type::Integer(Signedness::Unsigned, IntegerBitSize::ThirtyTwo)))
+        Self::numeric(Type::Integer(Signedness::Unsigned, IntegerBitSize::ThirtyTwo))
     }
 
     pub(crate) fn follow_bindings(&self) -> Self {
@@ -178,7 +212,7 @@ impl Kind {
             Self::Normal => Self::Normal,
             Self::Integer => Self::Integer,
             Self::IntegerOrField => Self::IntegerOrField,
-            Self::Numeric(typ) => Self::Numeric(Box::new(typ.follow_bindings())),
+            Self::Numeric(typ) => Self::numeric(typ.follow_bindings()),
         }
     }
 
@@ -194,6 +228,10 @@ impl Kind {
 
             // Kind::Integer unifies with Kind::IntegerOrField
             (Kind::Integer | Kind::IntegerOrField, Kind::Integer | Kind::IntegerOrField) => true,
+
+            // Kind::IntegerOrField unifies with Kind::Numeric(_)
+            (Kind::IntegerOrField, Kind::Numeric(_typ))
+            | (Kind::Numeric(_typ), Kind::IntegerOrField) => true,
 
             // Kind::Numeric unifies along its Type argument
             (Kind::Numeric(lhs), Kind::Numeric(rhs)) => {
@@ -222,11 +260,36 @@ impl Kind {
     /// during monomorphization.
     pub(crate) fn default_type(&self) -> Option<Type> {
         match self {
-            Kind::Any => None,
             Kind::IntegerOrField => Some(Type::default_int_or_field_type()),
             Kind::Integer => Some(Type::default_int_type()),
-            Kind::Normal => None,
             Kind::Numeric(typ) => Some(*typ.clone()),
+            Kind::Any | Kind::Normal => None,
+        }
+    }
+
+    fn integral_maximum_size(&self) -> Option<FieldElement> {
+        match self.follow_bindings() {
+            Kind::Any | Kind::IntegerOrField | Kind::Integer | Kind::Normal => None,
+            Self::Numeric(typ) => typ.integral_maximum_size(),
+        }
+    }
+
+    /// Ensure the given value fits in self.integral_maximum_size()
+    pub(crate) fn ensure_value_fits(
+        &self,
+        value: FieldElement,
+        location: Location,
+    ) -> Result<FieldElement, TypeCheckError> {
+        match self.integral_maximum_size() {
+            None => Ok(value),
+            Some(maximum_size) => (value <= maximum_size).then_some(value).ok_or_else(|| {
+                TypeCheckError::OverflowingConstant {
+                    value,
+                    kind: self.clone(),
+                    maximum_size,
+                    location,
+                }
+            }),
         }
     }
 }
@@ -252,6 +315,7 @@ pub enum QuotedType {
     Type,
     TypedExpr,
     StructDefinition,
+    EnumDefinition,
     TraitConstraint,
     TraitDefinition,
     TraitImpl,
@@ -266,24 +330,55 @@ pub enum QuotedType {
 /// the binding to later be undone if needed.
 pub type TypeBindings = HashMap<TypeVariableId, (TypeVariable, Kind, Type)>;
 
-/// Represents a struct type in the type system. Each instance of this
-/// rust struct will be shared across all Type::Struct variants that represent
-/// the same struct type.
-#[derive(Eq)]
-pub struct StructType {
-    /// A unique id representing this struct type. Used to check if two
-    /// struct types are equal.
-    pub id: StructId,
+/// Represents a struct or enum type in the type system. Each instance of this
+/// rust struct will be shared across all Type::DataType variants that represent
+/// the same struct or enum type.
+pub struct DataType {
+    /// A unique id representing this type. Used to check if two types are equal.
+    pub id: TypeId,
 
     pub name: Ident,
 
-    /// Fields are ordered and private, they should only
-    /// be accessed through get_field(), get_fields(), or instantiate()
+    /// A type's body is private to force struct fields or enum variants to only be
+    /// accessed through get_field(), get_fields(), instantiate(), or similar functions
     /// since these will handle applying generic arguments to fields as well.
-    fields: Vec<(Ident, Type)>,
+    body: TypeBody,
 
     pub generics: Generics,
     pub location: Location,
+}
+
+enum TypeBody {
+    /// A type with no body is still in the process of being created
+    None,
+    Struct(Vec<StructField>),
+
+    #[allow(unused)]
+    Enum(Vec<EnumVariant>),
+}
+
+#[derive(Clone)]
+pub struct StructField {
+    pub visibility: ItemVisibility,
+    pub name: Ident,
+    pub typ: Type,
+}
+
+#[derive(Clone)]
+pub struct EnumVariant {
+    pub name: Ident,
+    pub params: Vec<Type>,
+
+    /// True if this variant was declared as a function.
+    /// Required to distinguish `Foo::Bar` from `Foo::Bar()`
+    /// for zero-parameter variants. Only required for printing.
+    pub is_function: bool,
+}
+
+impl EnumVariant {
+    pub fn new(name: Ident, params: Vec<Type>, is_function: bool) -> EnumVariant {
+        Self { name, params, is_function }
+    }
 }
 
 /// Corresponds to generic lists such as `<T, U>` in the source program.
@@ -300,7 +395,7 @@ pub type Generics = Vec<ResolvedGeneric>;
 pub struct ResolvedGeneric {
     pub name: Rc<String>,
     pub type_var: TypeVariable,
-    pub span: Span,
+    pub location: Location,
 }
 
 impl ResolvedGeneric {
@@ -311,10 +406,6 @@ impl ResolvedGeneric {
     pub fn kind(&self) -> Kind {
         self.type_var.kind()
     }
-
-    pub(crate) fn is_numeric(&self) -> bool {
-        self.kind().is_numeric()
-    }
 }
 
 enum FunctionCoercionResult {
@@ -323,94 +414,179 @@ enum FunctionCoercionResult {
     UnconstrainedMismatch(Type),
 }
 
-impl std::hash::Hash for StructType {
+impl std::hash::Hash for DataType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
 
-impl PartialEq for StructType {
+impl Eq for DataType {}
+
+impl PartialEq for DataType {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl PartialOrd for StructType {
+impl PartialOrd for DataType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for StructType {
+impl Ord for DataType {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.id.cmp(&other.id)
     }
 }
 
-impl StructType {
-    pub fn new(
-        id: StructId,
-        name: Ident,
-
-        location: Location,
-        fields: Vec<(Ident, Type)>,
-        generics: Generics,
-    ) -> StructType {
-        StructType { id, fields, name, location, generics }
+impl DataType {
+    pub fn new(id: TypeId, name: Ident, location: Location, generics: Generics) -> DataType {
+        DataType { id, name, location, generics, body: TypeBody::None }
     }
 
     /// To account for cyclic references between structs, a struct's
     /// fields are resolved strictly after the struct itself is initially
     /// created. Therefore, this method is used to set the fields once they
     /// become known.
-    pub fn set_fields(&mut self, fields: Vec<(Ident, Type)>) {
-        self.fields = fields;
+    pub fn set_fields(&mut self, fields: Vec<StructField>) {
+        self.body = TypeBody::Struct(fields);
     }
 
-    pub fn num_fields(&self) -> usize {
-        self.fields.len()
+    pub(crate) fn init_variants(&mut self) {
+        match &mut self.body {
+            TypeBody::None => {
+                self.body = TypeBody::Enum(vec![]);
+            }
+            _ => panic!("Called init_variants but body was None"),
+        }
     }
 
-    /// Returns the field matching the given field name, as well as its field index.
-    pub fn get_field(&self, field_name: &str, generic_args: &[Type]) -> Option<(Type, usize)> {
+    pub(crate) fn push_variant(&mut self, variant: EnumVariant) {
+        match &mut self.body {
+            TypeBody::Enum(variants) => variants.push(variant),
+            _ => panic!("Called push_variant on {self} but body wasn't an enum"),
+        }
+    }
+
+    pub fn is_struct(&self) -> bool {
+        matches!(&self.body, TypeBody::Struct(_))
+    }
+
+    pub fn is_enum(&self) -> bool {
+        matches!(&self.body, TypeBody::Enum(_))
+    }
+
+    /// Retrieve the fields of this type with no modifications.
+    /// Returns None if this is not a struct type.
+    pub fn fields_raw(&self) -> Option<&[StructField]> {
+        match &self.body {
+            TypeBody::Struct(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// Retrieve the variants of this type with no modifications.
+    /// Panics if this is not an enum type.
+    fn variants_raw(&self) -> Option<&[EnumVariant]> {
+        match &self.body {
+            TypeBody::Enum(variants) => Some(variants),
+            _ => None,
+        }
+    }
+
+    /// Return the generics on this type as a vector of types
+    pub fn generic_types(&self) -> Vec<Type> {
+        vecmap(&self.generics, |generic| {
+            Type::NamedGeneric(generic.type_var.clone(), generic.name.clone())
+        })
+    }
+
+    /// Returns the field matching the given field name, as well as its visibility and field index.
+    /// Always returns None if this is not a struct type.
+    pub fn get_field(
+        &self,
+        field_name: &str,
+        generic_args: &[Type],
+    ) -> Option<(Type, ItemVisibility, usize)> {
         assert_eq!(self.generics.len(), generic_args.len());
 
-        self.fields.iter().enumerate().find(|(_, (name, _))| name.0.contents == field_name).map(
-            |(i, (_, typ))| {
-                let substitutions = self
-                    .generics
-                    .iter()
-                    .zip(generic_args)
-                    .map(|(old, new)| {
-                        (
-                            old.type_var.id(),
-                            (old.type_var.clone(), old.type_var.kind(), new.clone()),
-                        )
-                    })
-                    .collect();
+        let mut fields = self.fields_raw()?.iter().enumerate();
+        fields.find(|(_, field)| field.name.0.contents == field_name).map(|(i, field)| {
+            let generics = self.generics.iter().zip(generic_args);
+            let substitutions = generics
+                .map(|(old, new)| {
+                    (old.type_var.id(), (old.type_var.clone(), old.type_var.kind(), new.clone()))
+                })
+                .collect();
 
-                (typ.substitute(&substitutions), i)
-            },
-        )
+            (field.typ.substitute(&substitutions), field.visibility, i)
+        })
     }
 
     /// Returns all the fields of this type, after being applied to the given generic arguments.
-    pub fn get_fields(&self, generic_args: &[Type]) -> Vec<(String, Type)> {
+    /// Returns None if this is not a struct type.
+    pub fn get_fields_with_visibility(
+        &self,
+        generic_args: &[Type],
+    ) -> Option<Vec<(String, ItemVisibility, Type)>> {
+        let substitutions = self.get_fields_substitutions(generic_args);
+
+        Some(vecmap(self.fields_raw()?, |field| {
+            let name = field.name.0.contents.clone();
+            (name, field.visibility, field.typ.substitute(&substitutions))
+        }))
+    }
+
+    /// Retrieve the fields of this type. Returns None if this is not a field type
+    pub fn get_fields(&self, generic_args: &[Type]) -> Option<Vec<(String, Type)>> {
+        let substitutions = self.get_fields_substitutions(generic_args);
+
+        Some(vecmap(self.fields_raw()?, |field| {
+            let name = field.name.0.contents.clone();
+            (name, field.typ.substitute(&substitutions))
+        }))
+    }
+
+    /// Retrieve the variants of this type. Returns None if this is not an enum type
+    pub fn get_variants(&self, generic_args: &[Type]) -> Option<Vec<(String, Vec<Type>)>> {
+        let substitutions = self.get_fields_substitutions(generic_args);
+
+        Some(vecmap(self.variants_raw()?, |variant| {
+            let name = variant.name.to_string();
+            let args = vecmap(&variant.params, |param| param.substitute(&substitutions));
+            (name, args)
+        }))
+    }
+
+    /// Retrieve the given variant at the given variant index of this type.
+    /// Returns None if this is not an enum type or `variant_index` is out of bounds.
+    pub fn get_variant(
+        &self,
+        variant_index: usize,
+        generic_args: &[Type],
+    ) -> Option<(String, Vec<Type>)> {
+        let substitutions = self.get_fields_substitutions(generic_args);
+        let variant = self.variants_raw()?.get(variant_index)?;
+
+        let name = variant.name.to_string();
+        let args = vecmap(&variant.params, |param| param.substitute(&substitutions));
+        Some((name, args))
+    }
+
+    fn get_fields_substitutions(
+        &self,
+        generic_args: &[Type],
+    ) -> HashMap<TypeVariableId, (TypeVariable, Kind, Type)> {
         assert_eq!(self.generics.len(), generic_args.len());
 
-        let substitutions = self
-            .generics
+        self.generics
             .iter()
             .zip(generic_args)
             .map(|(old, new)| {
                 (old.type_var.id(), (old.type_var.clone(), old.type_var.kind(), new.clone()))
             })
-            .collect();
-
-        vecmap(&self.fields, |(name, typ)| {
-            let name = name.0.contents.clone();
-            (name, typ.substitute(&substitutions))
-        })
+            .collect()
     }
 
     /// Returns the name and raw types of each field of this type.
@@ -419,24 +595,45 @@ impl StructType {
     ///
     /// This method is almost never what is wanted for type checking or monomorphization,
     /// prefer to use `get_fields` whenever possible.
-    pub fn get_fields_as_written(&self) -> Vec<(String, Type)> {
-        vecmap(&self.fields, |(name, typ)| (name.0.contents.clone(), typ.clone()))
+    ///
+    /// Returns None if this is not a struct type.
+    pub fn get_fields_as_written(&self) -> Option<Vec<StructField>> {
+        Some(self.fields_raw()?.to_vec())
     }
 
-    /// Returns the field at the given index. Panics if no field exists at the given index.
-    pub fn field_at(&self, index: usize) -> &(Ident, Type) {
-        &self.fields[index]
+    /// Returns the name and raw parameters of each variant of this type.
+    /// This will not substitute any generic arguments so a generic variant like `X`
+    /// in `enum Foo<T> { X(T) }` will return a `("X", Vec<T>)` pair.
+    ///
+    /// Returns None if this is not an enum type.
+    pub fn get_variants_as_written(&self) -> Option<Vec<EnumVariant>> {
+        Some(self.variants_raw()?.to_vec())
     }
 
-    pub fn field_names(&self) -> BTreeSet<Ident> {
-        self.fields.iter().map(|(name, _)| name.clone()).collect()
+    /// Returns the name and raw parameters of the variant at the given variant index.
+    /// This will not substitute any generic arguments so a generic variant like `X`
+    /// in `enum Foo<T> { X(T) }` will return a `("X", Vec<T>)` pair.
+    ///
+    /// Returns None if this is not an enum type or the given variant index is out of bounds.
+    pub fn get_variant_as_written(&self, variant_index: usize) -> Option<&EnumVariant> {
+        self.variants_raw()?.get(variant_index)
     }
 
-    /// Search the fields of a struct for any types with a `TypeKind::Numeric`
-    pub fn find_numeric_generics_in_fields(&self, found_names: &mut Vec<String>) {
-        for (_, field) in self.fields.iter() {
-            field.find_numeric_type_vars(found_names);
-        }
+    /// Returns the field at the given index. Panics if no field exists at the given index or this
+    /// is not a struct type.
+    pub fn field_at(&self, index: usize) -> &StructField {
+        &self.fields_raw().unwrap()[index]
+    }
+
+    /// Returns the enum variant at the given index. Panics if no field exists at the given index
+    /// or this is not an enum type.
+    pub fn variant_at(&self, index: usize) -> &EnumVariant {
+        &self.variants_raw().unwrap()[index]
+    }
+
+    /// Returns each of this type's field names. Returns None if this is not a struct type.
+    pub fn field_names(&self) -> Option<BTreeSet<Ident>> {
+        Some(self.fields_raw()?.iter().map(|field| field.name.clone()).collect())
     }
 
     /// Instantiate this struct type, returning a Vec of the new generic args (in
@@ -444,9 +641,38 @@ impl StructType {
     pub fn instantiate(&self, interner: &mut NodeInterner) -> Vec<Type> {
         vecmap(&self.generics, |generic| interner.next_type_variable_with_kind(generic.kind()))
     }
+
+    /// Returns the function type of the variant at the given index of this enum.
+    /// Requires the `Shared<DataType>` handle of self to create the given function type.
+    /// Panics if this is not an enum.
+    ///
+    /// The function type uses the variant "as written" ie. no generic substitutions.
+    /// Although the returned function is technically generic, Type::Function is returned
+    /// instead of Type::Forall.
+    pub fn variant_function_type(&self, variant_index: usize, this: Shared<DataType>) -> Type {
+        let variant = self.variant_at(variant_index);
+        let args = variant.params.clone();
+        assert_eq!(this.borrow().id, self.id);
+        let generics = self.generic_types();
+        let ret = Box::new(Type::DataType(this, generics));
+        Type::Function(args, ret, Box::new(Type::Unit), false)
+    }
+
+    /// Returns the function type of the variant at the given index of this enum.
+    /// Requires the `Shared<DataType>` handle of self to create the given function type.
+    /// Panics if this is not an enum.
+    pub fn variant_function_type_with_forall(
+        &self,
+        variant_index: usize,
+        this: Shared<DataType>,
+    ) -> Type {
+        let function_type = self.variant_function_type(variant_index, this);
+        let typevars = vecmap(&self.generics, |generic| generic.type_var.clone());
+        Type::Forall(typevars, Box::new(function_type))
+    }
 }
 
-impl std::fmt::Display for StructType {
+impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
     }
@@ -523,6 +749,11 @@ impl TypeAlias {
 
         self.typ.substitute(&substitutions)
     }
+
+    pub fn instantiate(&self, interner: &NodeInterner) -> Type {
+        let args = vecmap(&self.generics, |_| interner.next_type_variable());
+        self.get_type(&args)
+    }
 }
 
 /// A shared, mutable reference to some T.
@@ -582,6 +813,7 @@ impl<T> Shared<T> {
 
 /// A restricted subset of binary operators useable on
 /// type level integers for use in the array length positions of types.
+#[cfg_attr(test, derive(Arbitrary))]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BinaryTypeOperator {
     Addition,
@@ -622,12 +854,17 @@ impl TypeVariable {
         *self.1.borrow_mut() = TypeBinding::Bound(typ);
     }
 
-    pub fn try_bind(&self, binding: Type, kind: &Kind, span: Span) -> Result<(), TypeCheckError> {
+    pub fn try_bind(
+        &self,
+        binding: Type,
+        kind: &Kind,
+        location: Location,
+    ) -> Result<(), TypeCheckError> {
         if !binding.kind().unifies(kind) {
             return Err(TypeCheckError::TypeKindMismatch {
                 expected_kind: format!("{}", kind),
                 expr_kind: format!("{}", binding.kind()),
-                expr_span: span,
+                expr_location: location,
             });
         }
 
@@ -639,7 +876,7 @@ impl TypeVariable {
         };
 
         if binding.occurs(id) {
-            Err(TypeCheckError::CyclicType { span, typ: binding })
+            Err(TypeCheckError::CyclicType { location, typ: binding })
         } else {
             *self.1.borrow_mut() = TypeBinding::Bound(binding);
             Ok(())
@@ -680,8 +917,10 @@ impl TypeVariable {
     /// and if unbound, that it's a Kind::Integer
     pub fn is_integer(&self) -> bool {
         match &*self.borrow() {
-            TypeBinding::Bound(binding) => matches!(binding, Type::Integer(..)),
-            TypeBinding::Unbound(_, type_var_kind) => matches!(type_var_kind, Kind::Integer),
+            TypeBinding::Bound(binding) => matches!(binding.follow_bindings(), Type::Integer(..)),
+            TypeBinding::Unbound(_, type_var_kind) => {
+                matches!(type_var_kind.follow_bindings(), Kind::Integer)
+            }
         }
     }
 
@@ -690,9 +929,20 @@ impl TypeVariable {
     pub fn is_integer_or_field(&self) -> bool {
         match &*self.borrow() {
             TypeBinding::Bound(binding) => {
-                matches!(binding, Type::Integer(..) | Type::FieldElement)
+                matches!(binding.follow_bindings(), Type::Integer(..) | Type::FieldElement)
             }
-            TypeBinding::Unbound(_, type_var_kind) => matches!(type_var_kind, Kind::IntegerOrField),
+            TypeBinding::Unbound(_, type_var_kind) => {
+                matches!(type_var_kind.follow_bindings(), Kind::IntegerOrField)
+            }
+        }
+    }
+
+    /// If value_level, only check for Type::FieldElement,
+    /// else only check for a type-level FieldElement
+    fn is_field_element(&self, value_level: bool) -> bool {
+        match &*self.borrow() {
+            TypeBinding::Bound(binding) => binding.is_field_element(value_level),
+            TypeBinding::Unbound(_, type_var_kind) => type_var_kind.is_field_element(value_level),
         }
     }
 }
@@ -745,7 +995,7 @@ impl std::fmt::Display for Type {
                     }
                 }
             }
-            Type::Struct(s, args) => {
+            Type::DataType(s, args) => {
                 let args = vecmap(args, |arg| arg.to_string());
                 if args.is_empty() {
                     write!(f, "{}", s.borrow())
@@ -780,6 +1030,7 @@ impl std::fmt::Display for Type {
                 TypeBinding::Unbound(_, _) if name.is_empty() => write!(f, "_"),
                 TypeBinding::Unbound(_, _) => write!(f, "{name}"),
             },
+            Type::CheckedCast { to, .. } => write!(f, "{to}"),
             Type::Constant(x, _kind) => write!(f, "{x}"),
             Type::Forall(typevars, typ) => {
                 let typevars = vecmap(typevars, |var| var.id().to_string());
@@ -803,8 +1054,8 @@ impl std::fmt::Display for Type {
                 write!(f, "&mut {element}")
             }
             Type::Quoted(quoted) => write!(f, "{}", quoted),
-            Type::InfixExpr(lhs, op, rhs) => {
-                let this = self.canonicalize();
+            Type::InfixExpr(lhs, op, rhs, _) => {
+                let this = self.canonicalize_checked();
 
                 // Prevent infinite recursion
                 if this != *self {
@@ -853,6 +1104,7 @@ impl std::fmt::Display for QuotedType {
             QuotedType::Type => write!(f, "Type"),
             QuotedType::TypedExpr => write!(f, "TypedExpr"),
             QuotedType::StructDefinition => write!(f, "StructDefinition"),
+            QuotedType::EnumDefinition => write!(f, "EnumDefinition"),
             QuotedType::TraitDefinition => write!(f, "TraitDefinition"),
             QuotedType::TraitConstraint => write!(f, "TraitConstraint"),
             QuotedType::TraitImpl => write!(f, "TraitImpl"),
@@ -923,6 +1175,17 @@ impl Type {
         matches!(self.follow_bindings(), Type::Integer(_, _))
     }
 
+    /// If value_level, only check for Type::FieldElement,
+    /// else only check for a type-level FieldElement
+    fn is_field_element(&self, value_level: bool) -> bool {
+        match self.follow_bindings() {
+            Type::FieldElement => value_level,
+            Type::TypeVariable(var) => var.is_field_element(value_level),
+            Type::Constant(_, kind) => !value_level && kind.is_field_element(true),
+            _ => false,
+        }
+    }
+
     pub fn is_signed(&self) -> bool {
         matches!(self.follow_bindings(), Type::Integer(Signedness::Signed, _))
     }
@@ -950,92 +1213,40 @@ impl Type {
         }
     }
 
-    pub fn find_numeric_type_vars(&self, found_names: &mut Vec<String>) {
-        // Return whether the named generic has a Kind::Numeric and save its name
-        let named_generic_is_numeric = |typ: &Type, found_names: &mut Vec<String>| {
-            if let Type::NamedGeneric(var, name) = typ {
-                if var.kind().is_numeric() {
-                    found_names.push(name.to_string());
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        match self {
+    pub fn is_primitive(&self) -> bool {
+        match self.follow_bindings() {
             Type::FieldElement
-            | Type::Integer(_, _)
+            | Type::Array(_, _)
+            | Type::Slice(_)
+            | Type::Integer(..)
             | Type::Bool
+            | Type::String(_)
+            | Type::FmtString(_, _)
             | Type::Unit
-            | Type::Error
-            | Type::Constant(_, _)
-            | Type::Forall(_, _)
-            | Type::Quoted(_) => {}
+            | Type::Function(..)
+            | Type::Tuple(..) => true,
+            Type::Alias(alias_type, generics) => {
+                alias_type.borrow().get_type(&generics).is_primitive()
+            }
+            Type::MutableReference(typ) => typ.is_primitive(),
+            Type::DataType(..)
+            | Type::TypeVariable(..)
+            | Type::TraitAsType(..)
+            | Type::NamedGeneric(..)
+            | Type::CheckedCast { .. }
+            | Type::Forall(..)
+            | Type::Constant(..)
+            | Type::Quoted(..)
+            | Type::InfixExpr(..)
+            | Type::Error => false,
+        }
+    }
 
-            Type::TypeVariable(type_var) => {
-                if let TypeBinding::Bound(typ) = &*type_var.borrow() {
-                    named_generic_is_numeric(typ, found_names);
-                }
-            }
-
-            Type::NamedGeneric(_, _) => {
-                named_generic_is_numeric(self, found_names);
-            }
-
-            Type::TraitAsType(_, _, args) => {
-                for arg in args.ordered.iter() {
-                    arg.find_numeric_type_vars(found_names);
-                }
-                for arg in args.named.iter() {
-                    arg.typ.find_numeric_type_vars(found_names);
-                }
-            }
-            Type::Array(length, elem) => {
-                elem.find_numeric_type_vars(found_names);
-                named_generic_is_numeric(length, found_names);
-            }
-            Type::Slice(elem) => elem.find_numeric_type_vars(found_names),
-            Type::Tuple(fields) => {
-                for field in fields.iter() {
-                    field.find_numeric_type_vars(found_names);
-                }
-            }
-            Type::Function(parameters, return_type, env, _unconstrained) => {
-                for parameter in parameters.iter() {
-                    parameter.find_numeric_type_vars(found_names);
-                }
-                return_type.find_numeric_type_vars(found_names);
-                env.find_numeric_type_vars(found_names);
-            }
-            Type::Struct(_, generics) => {
-                for generic in generics.iter() {
-                    if !named_generic_is_numeric(generic, found_names) {
-                        generic.find_numeric_type_vars(found_names);
-                    }
-                }
-            }
-            Type::Alias(_, generics) => {
-                for generic in generics.iter() {
-                    if !named_generic_is_numeric(generic, found_names) {
-                        generic.find_numeric_type_vars(found_names);
-                    }
-                }
-            }
-            Type::MutableReference(element) => element.find_numeric_type_vars(found_names),
-            Type::String(length) => {
-                named_generic_is_numeric(length, found_names);
-            }
-            Type::FmtString(length, elements) => {
-                elements.find_numeric_type_vars(found_names);
-                named_generic_is_numeric(length, found_names);
-            }
-            Type::InfixExpr(lhs, _op, rhs) => {
-                lhs.find_numeric_type_vars(found_names);
-                rhs.find_numeric_type_vars(found_names);
-            }
+    pub fn is_function(&self) -> bool {
+        match self.follow_bindings_shallow().as_ref() {
+            Type::Function(..) => true,
+            Type::Alias(alias_type, _) => alias_type.borrow().typ.is_function(),
+            _ => false,
         }
     }
 
@@ -1065,8 +1276,9 @@ impl Type {
             | Type::Forall(_, _)
             | Type::Quoted(_)
             | Type::Slice(_)
-            | Type::InfixExpr(_, _, _)
             | Type::TraitAsType(..) => false,
+
+            Type::CheckedCast { to, .. } => to.is_valid_for_program_input(),
 
             Type::Alias(alias, generics) => {
                 let alias = alias.borrow();
@@ -1078,11 +1290,18 @@ impl Type {
             }
             Type::String(length) => length.is_valid_for_program_input(),
             Type::Tuple(elements) => elements.iter().all(|elem| elem.is_valid_for_program_input()),
-            Type::Struct(definition, generics) => definition
-                .borrow()
-                .get_fields(generics)
-                .into_iter()
-                .all(|(_, field)| field.is_valid_for_program_input()),
+            Type::DataType(definition, generics) => {
+                if let Some(fields) = definition.borrow().get_fields(generics) {
+                    fields.into_iter().all(|(_, field)| field.is_valid_for_program_input())
+                } else {
+                    // Arbitrarily disallow enums from program input, though we may support them later
+                    false
+                }
+            }
+
+            Type::InfixExpr(lhs, _, rhs, _) => {
+                lhs.is_valid_for_program_input() && rhs.is_valid_for_program_input()
+            }
         }
     }
 
@@ -1117,6 +1336,8 @@ impl Type {
             | Type::Quoted(_)
             | Type::TraitAsType(..) => false,
 
+            Type::CheckedCast { to, .. } => to.is_valid_non_inlined_function_input(),
+
             Type::Alias(alias, generics) => {
                 let alias = alias.borrow();
                 alias.get_type(generics).is_valid_non_inlined_function_input()
@@ -1127,11 +1348,14 @@ impl Type {
             }
             Type::String(length) => length.is_valid_non_inlined_function_input(),
             Type::Tuple(elements) => elements.iter().all(|elem| elem.is_valid_non_inlined_function_input()),
-            Type::Struct(definition, generics) => definition
-                .borrow()
-                .get_fields(generics)
-                .into_iter()
-                .all(|(_, field)| field.is_valid_non_inlined_function_input()),
+            Type::DataType(definition, generics) => {
+                if let Some(fields) = definition.borrow().get_fields(generics) {
+                    fields.into_iter()
+                    .all(|(_, field)| field.is_valid_non_inlined_function_input())
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -1158,6 +1382,8 @@ impl Type {
                 }
             }
 
+            Type::CheckedCast { to, .. } => to.is_valid_for_unconstrained_boundary(),
+
             // Quoted objects only exist at compile-time where the only execution
             // environment is the interpreter. In this environment, they are valid.
             Type::Quoted(_) => true,
@@ -1177,11 +1403,13 @@ impl Type {
             Type::Tuple(elements) => {
                 elements.iter().all(|elem| elem.is_valid_for_unconstrained_boundary())
             }
-            Type::Struct(definition, generics) => definition
-                .borrow()
-                .get_fields(generics)
-                .into_iter()
-                .all(|(_, field)| field.is_valid_for_unconstrained_boundary()),
+            Type::DataType(definition, generics) => {
+                if let Some(fields) = definition.borrow().get_fields(generics) {
+                    fields.into_iter().all(|(_, field)| field.is_valid_for_unconstrained_boundary())
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -1190,6 +1418,7 @@ impl Type {
     pub fn generic_count(&self) -> usize {
         match self {
             Type::Forall(generics, _) => generics.len(),
+            Type::CheckedCast { to, .. } => to.generic_count(),
             Type::TypeVariable(type_variable) | Type::NamedGeneric(type_variable, _) => {
                 match &*type_variable.borrow() {
                     TypeBinding::Bound(binding) => binding.generic_count(),
@@ -1229,30 +1458,32 @@ impl Type {
 
     pub(crate) fn kind(&self) -> Kind {
         match self {
+            Type::CheckedCast { to, .. } => to.kind(),
             Type::NamedGeneric(var, _) => var.kind(),
             Type::Constant(_, kind) => kind.clone(),
             Type::TypeVariable(var) => match &*var.borrow() {
                 TypeBinding::Bound(ref typ) => typ.kind(),
                 TypeBinding::Unbound(_, ref type_var_kind) => type_var_kind.clone(),
             },
-            Type::InfixExpr(lhs, _op, rhs) => lhs.infix_kind(rhs),
+            Type::InfixExpr(lhs, _op, rhs, _) => lhs.infix_kind(rhs),
+            Type::Alias(def, generics) => def.borrow().get_type(generics).kind(),
+            // This is a concrete FieldElement, not an IntegerOrField
             Type::FieldElement
+            | Type::Integer(..)
             | Type::Array(..)
             | Type::Slice(..)
-            | Type::Integer(..)
             | Type::Bool
             | Type::String(..)
             | Type::FmtString(..)
             | Type::Unit
             | Type::Tuple(..)
-            | Type::Struct(..)
-            | Type::Alias(..)
+            | Type::DataType(..)
             | Type::TraitAsType(..)
             | Type::Function(..)
             | Type::MutableReference(..)
             | Type::Forall(..)
-            | Type::Quoted(..)
-            | Type::Error => Kind::Normal,
+            | Type::Quoted(..) => Kind::Normal,
+            Type::Error => Kind::Any,
         }
     }
 
@@ -1263,32 +1494,86 @@ impl Type {
         if self_kind.unifies(&other_kind) {
             self_kind
         } else {
-            Kind::Numeric(Box::new(Type::Error))
+            Kind::numeric(Type::Error)
         }
     }
 
+    /// Creates an `InfixExpr`.
+    pub fn infix_expr(lhs: Box<Type>, op: BinaryTypeOperator, rhs: Box<Type>) -> Type {
+        Self::new_infix_expr(lhs, op, rhs, false)
+    }
+
+    /// Creates an `InfixExpr` that results from the compiler trying to unify something like
+    /// `4 = a * b` into `a = 4 / b` (where `4 / b` is the "inverted" expression).
+    pub fn inverted_infix_expr(lhs: Box<Type>, op: BinaryTypeOperator, rhs: Box<Type>) -> Type {
+        Self::new_infix_expr(lhs, op, rhs, true)
+    }
+
+    pub fn new_infix_expr(
+        lhs: Box<Type>,
+        op: BinaryTypeOperator,
+        rhs: Box<Type>,
+        inversion: bool,
+    ) -> Type {
+        // If an InfixExpr like this is tried to be created:
+        //
+        // a * (b / a)
+        //
+        // where `b / a` resulted from the compiler creating an inverted InfixExpr from a previous
+        // unification (that is, the compiler had `b = a / y` and ended up doing `y = b / a` where
+        // `y` is `rhs` here) then we can simplify this to just `b` because there wasn't an actual
+        // division in the original expression, so multiplying it back is just going back to the
+        // original `y`
+        if let Type::InfixExpr(rhs_lhs, rhs_op, rhs_rhs, true) = &*rhs {
+            if op.approx_inverse() == Some(*rhs_op) && lhs == *rhs_rhs {
+                return *rhs_lhs.clone();
+            }
+        }
+
+        // Same thing but on the other side.
+        if let Type::InfixExpr(lhs_lhs, lhs_op, lhs_rhs, true) = &*lhs {
+            if op.approx_inverse() == Some(*lhs_op) && rhs == *lhs_rhs {
+                return *lhs_lhs.clone();
+            }
+        }
+
+        Self::InfixExpr(lhs, op, rhs, inversion)
+    }
+
     /// Returns the number of field elements required to represent the type once encoded.
-    pub fn field_count(&self) -> u32 {
+    pub fn field_count(&self, location: &Location) -> u32 {
         match self {
             Type::FieldElement | Type::Integer { .. } | Type::Bool => 1,
             Type::Array(size, typ) => {
                 let length = size
-                    .evaluate_to_u32()
+                    .evaluate_to_u32(*location)
                     .expect("Cannot have variable sized arrays as a parameter to main");
                 let typ = typ.as_ref();
-                length * typ.field_count()
+                length * typ.field_count(location)
             }
-            Type::Struct(def, args) => {
+            Type::DataType(def, args) => {
                 let struct_type = def.borrow();
-                let fields = struct_type.get_fields(args);
-                fields.iter().fold(0, |acc, (_, field_type)| acc + field_type.field_count())
+                if let Some(fields) = struct_type.get_fields(args) {
+                    fields.iter().map(|(_, field_type)| field_type.field_count(location)).sum()
+                } else if let Some(variants) = struct_type.get_variants(args) {
+                    let mut size = 1; // start with the tag size
+                    for (_, args) in variants {
+                        for arg in args {
+                            size += arg.field_count(location);
+                        }
+                    }
+                    size
+                } else {
+                    0
+                }
             }
-            Type::Alias(def, generics) => def.borrow().get_type(generics).field_count(),
+            Type::CheckedCast { to, .. } => to.field_count(location),
+            Type::Alias(def, generics) => def.borrow().get_type(generics).field_count(location),
             Type::Tuple(fields) => {
-                fields.iter().fold(0, |acc, field_typ| acc + field_typ.field_count())
+                fields.iter().fold(0, |acc, field_typ| acc + field_typ.field_count(location))
             }
             Type::String(size) => size
-                .evaluate_to_u32()
+                .evaluate_to_u32(*location)
                 .expect("Cannot have variable sized strings as a parameter to main"),
             Type::FmtString(_, _)
             | Type::Unit
@@ -1318,10 +1603,14 @@ impl Type {
     pub(crate) fn contains_slice(&self) -> bool {
         match self {
             Type::Slice(_) => true,
-            Type::Struct(struct_typ, generics) => {
-                let fields = struct_typ.borrow().get_fields(generics);
-                for field in fields.iter() {
-                    if field.1.contains_slice() {
+            Type::DataType(typ, generics) => {
+                let typ = typ.borrow();
+                if let Some(fields) = typ.get_fields(generics) {
+                    if fields.iter().any(|(_, field)| field.contains_slice()) {
+                        return true;
+                    }
+                } else if let Some(variants) = typ.get_variants(generics) {
+                    if variants.iter().flat_map(|(_, args)| args).any(|typ| typ.contains_slice()) {
                         return true;
                     }
                 }
@@ -1459,6 +1748,7 @@ impl Type {
         match self {
             Type::TypeVariable(var) => Some((var.1.clone(), var.kind())),
             Type::NamedGeneric(var, _) => Some((var.1.clone(), var.kind())),
+            Type::CheckedCast { to, .. } => to.get_inner_type_variable(),
             _ => None,
         }
     }
@@ -1485,12 +1775,22 @@ impl Type {
     ) -> Result<(), UnificationError> {
         use Type::*;
 
-        let lhs = match self {
+        // If the two types are exactly the same then they trivially unify.
+        // This check avoids potentially unifying very complex types (usually infix
+        // expressions) when they are the same.
+        if self == other {
+            return Ok(());
+        }
+
+        let lhs = self.follow_bindings_shallow();
+        let rhs = other.follow_bindings_shallow();
+
+        let lhs = match lhs.as_ref() {
             Type::InfixExpr(..) => Cow::Owned(self.canonicalize()),
             other => Cow::Borrowed(other),
         };
 
-        let rhs = match other {
+        let rhs = match rhs.as_ref() {
             Type::InfixExpr(..) => Cow::Owned(other.canonicalize()),
             other => Cow::Borrowed(other),
         };
@@ -1562,7 +1862,7 @@ impl Type {
             // No recursive try_unify call for struct fields. Don't want
             // to mutate shared type variables within struct definitions.
             // This isn't possible currently but will be once noir gets generic types
-            (Struct(id_a, args_a), Struct(id_b, args_b)) => {
+            (DataType(id_a, args_a), DataType(id_b, args_b)) => {
                 if id_a == id_b && args_a.len() == args_b.len() {
                     for (a, b) in args_a.iter().zip(args_b) {
                         a.try_unify(b, bindings)?;
@@ -1571,6 +1871,10 @@ impl Type {
                 } else {
                     Err(UnificationError)
                 }
+            }
+
+            (CheckedCast { to, .. }, other) | (other, CheckedCast { to, .. }) => {
+                to.try_unify(other, bindings)
             }
 
             (NamedGeneric(binding, _), other) | (other, NamedGeneric(binding, _))
@@ -1615,7 +1919,7 @@ impl Type {
                 elem_a.try_unify(elem_b, bindings)
             }
 
-            (InfixExpr(lhs_a, op_a, rhs_a), InfixExpr(lhs_b, op_b, rhs_b)) => {
+            (InfixExpr(lhs_a, op_a, rhs_a, _), InfixExpr(lhs_b, op_b, rhs_b, _)) => {
                 if op_a == op_b {
                     // We need to preserve the original bindings since if syntactic equality
                     // fails we fall back to other equality strategies.
@@ -1635,21 +1939,22 @@ impl Type {
             }
 
             (Constant(value, kind), other) | (other, Constant(value, kind)) => {
-                // TODO(https://github.com/noir-lang/noir/pull/6137): replace evaluate_to_u32
-                if let Some(other_value) = other.evaluate_to_u32() {
+                let dummy_location = Location::dummy();
+                if let Ok(other_value) = other.evaluate_to_field_element(kind, dummy_location) {
                     if *value == other_value && kind.unifies(&other.kind()) {
                         Ok(())
                     } else {
                         Err(UnificationError)
                     }
-                } else if let InfixExpr(lhs, op, rhs) = other {
-                    if let Some(inverse) = op.inverse() {
+                } else if let InfixExpr(lhs, op, rhs, _) = other {
+                    if let Some(inverse) = op.approx_inverse() {
                         // Handle cases like `4 = a + b` by trying to solve to `a = 4 - b`
-                        let new_type = InfixExpr(
+                        let new_type = Type::inverted_infix_expr(
                             Box::new(Constant(*value, kind.clone())),
                             inverse,
                             rhs.clone(),
                         );
+
                         new_type.try_unify(lhs, bindings)?;
                         Ok(())
                     } else {
@@ -1712,7 +2017,7 @@ impl Type {
         &self,
         expected: &Type,
         expression: ExprId,
-        span: Span,
+        location: Location,
         interner: &mut NodeInterner,
         errors: &mut Vec<TypeCheckError>,
         make_error: impl FnOnce() -> TypeCheckError,
@@ -1732,14 +2037,16 @@ impl Type {
         match self.try_fn_to_unconstrained_fn_coercion(expected) {
             FunctionCoercionResult::NoCoercion => errors.push(make_error()),
             FunctionCoercionResult::Coerced(coerced_self) => {
-                coerced_self
-                    .unify_with_coercions(expected, expression, span, interner, errors, make_error);
+                coerced_self.unify_with_coercions(
+                    expected, expression, location, interner, errors, make_error,
+                );
             }
             FunctionCoercionResult::UnconstrainedMismatch(coerced_self) => {
-                errors.push(TypeCheckError::UnsafeFn { span });
+                errors.push(TypeCheckError::UnsafeFn { location });
 
-                coerced_self
-                    .unify_with_coercions(expected, expression, span, interner, errors, make_error);
+                coerced_self.unify_with_coercions(
+                    expected, expression, location, interner, errors, make_error,
+                );
             }
         }
     }
@@ -1780,7 +2087,7 @@ impl Type {
         if let (Type::Array(_size, element1), Type::Slice(element2)) = (&this, &target) {
             // We can only do the coercion if the `as_slice` method exists.
             // This is usually true, but some tests don't have access to the standard library.
-            if let Some(as_slice) = interner.lookup_primitive_method(&this, "as_slice", true) {
+            if let Some(as_slice) = interner.lookup_direct_method(&this, "as_slice", true) {
                 // Still have to ensure the element types match.
                 // Don't need to issue an error here if not, it will be done in unify_with_coercions
                 let mut bindings = TypeBindings::new();
@@ -1804,57 +2111,125 @@ impl Type {
 
     /// If this type is a Type::Constant (used in array lengths), or is bound
     /// to a Type::Constant, return the constant as a u32.
-    pub fn evaluate_to_u32(&self) -> Option<u32> {
-        if let Some((binding, _kind)) = self.get_inner_type_variable() {
-            if let TypeBinding::Bound(binding) = &*binding.borrow() {
-                return binding.evaluate_to_u32();
-            }
-        }
-
-        match self.canonicalize() {
-            Type::Array(len, _elem) => len.evaluate_to_u32(),
-            Type::Constant(x, _kind) => Some(x),
-            Type::InfixExpr(lhs, op, rhs) => {
-                let lhs_u32 = lhs.evaluate_to_u32()?;
-                let rhs_u32 = rhs.evaluate_to_u32()?;
-                op.function(lhs_u32, rhs_u32, &lhs.infix_kind(&rhs))
-            }
-            _ => None,
-        }
+    pub fn evaluate_to_u32(&self, location: Location) -> Result<u32, TypeCheckError> {
+        self.evaluate_to_field_element(&Kind::u32(), location).map(|field_element| {
+            field_element
+                .try_to_u32()
+                .expect("ICE: size should have already been checked by evaluate_to_field_element")
+        })
     }
 
-    /// Iterate over the fields of this type.
-    /// Panics if the type is not a struct or tuple.
-    pub fn iter_fields(&self) -> impl Iterator<Item = (String, Type)> {
-        let fields: Vec<_> = match self {
-            // Unfortunately the .borrow() here forces us to collect into a Vec
-            // only to have to call .into_iter again afterward. Trying to elide
-            // collecting to a Vec leads to us dropping the temporary Ref before
-            // the iterator is returned
-            Type::Struct(def, args) => vecmap(&def.borrow().fields, |(name, _)| {
-                let name = &name.0.contents;
-                let typ = def.borrow().get_field(name, args).unwrap().0;
-                (name.clone(), typ)
-            }),
-            Type::Tuple(fields) => {
-                let fields = fields.iter().enumerate();
-                vecmap(fields, |(i, field)| (i.to_string(), field.clone()))
+    // TODO(https://github.com/noir-lang/noir/issues/6260): remove
+    // the unifies checks once all kinds checks are implemented?
+    pub(crate) fn evaluate_to_field_element(
+        &self,
+        kind: &Kind,
+        location: Location,
+    ) -> Result<acvm::FieldElement, TypeCheckError> {
+        let run_simplifications = true;
+        self.evaluate_to_field_element_helper(kind, location, run_simplifications)
+    }
+
+    /// evaluate_to_field_element with optional generic arithmetic simplifications
+    pub(crate) fn evaluate_to_field_element_helper(
+        &self,
+        kind: &Kind,
+        location: Location,
+        run_simplifications: bool,
+    ) -> Result<acvm::FieldElement, TypeCheckError> {
+        if let Some((binding, binding_kind)) = self.get_inner_type_variable() {
+            if let TypeBinding::Bound(binding) = &*binding.borrow() {
+                if kind.unifies(&binding_kind) {
+                    return binding.evaluate_to_field_element_helper(
+                        &binding_kind,
+                        location,
+                        run_simplifications,
+                    );
+                }
             }
-            other => panic!("Tried to iterate over the fields of '{other}', which has none"),
-        };
-        fields.into_iter()
+        }
+
+        let could_be_checked_cast = false;
+        match self.canonicalize_helper(could_be_checked_cast, run_simplifications) {
+            Type::Constant(x, constant_kind) => {
+                if kind.unifies(&constant_kind) {
+                    kind.ensure_value_fits(x, location)
+                } else {
+                    Err(TypeCheckError::TypeKindMismatch {
+                        expected_kind: format!("{}", constant_kind),
+                        expr_kind: format!("{}", kind),
+                        expr_location: location,
+                    })
+                }
+            }
+            Type::InfixExpr(lhs, op, rhs, _) => {
+                let infix_kind = lhs.infix_kind(&rhs);
+                if kind.unifies(&infix_kind) {
+                    let lhs_value = lhs.evaluate_to_field_element_helper(
+                        &infix_kind,
+                        location,
+                        run_simplifications,
+                    )?;
+                    let rhs_value = rhs.evaluate_to_field_element_helper(
+                        &infix_kind,
+                        location,
+                        run_simplifications,
+                    )?;
+                    op.function(lhs_value, rhs_value, &infix_kind, location)
+                } else {
+                    Err(TypeCheckError::TypeKindMismatch {
+                        expected_kind: format!("{}", kind),
+                        expr_kind: format!("{}", infix_kind),
+                        expr_location: location,
+                    })
+                }
+            }
+            Type::CheckedCast { from, to } => {
+                let to_value = to.evaluate_to_field_element(kind, location)?;
+
+                // if both 'to' and 'from' evaluate to a constant,
+                // return None unless they match
+                let skip_simplifications = false;
+                if let Ok(from_value) =
+                    from.evaluate_to_field_element_helper(kind, location, skip_simplifications)
+                {
+                    if to_value == from_value {
+                        Ok(to_value)
+                    } else {
+                        let to = *to.clone();
+                        let from = *from.clone();
+                        Err(TypeCheckError::TypeCanonicalizationMismatch {
+                            to,
+                            from,
+                            to_value,
+                            from_value,
+                            location,
+                        })
+                    }
+                } else {
+                    Ok(to_value)
+                }
+            }
+            other => Err(TypeCheckError::NonConstantEvaluated { typ: other, location }),
+        }
     }
 
     /// Retrieves the type of the given field name
     /// Panics if the type is not a struct or tuple.
-    pub fn get_field_type(&self, field_name: &str) -> Option<Type> {
+    pub fn get_field_type_and_visibility(
+        &self,
+        field_name: &str,
+    ) -> Option<(Type, ItemVisibility)> {
         match self.follow_bindings() {
-            Type::Struct(def, args) => {
-                def.borrow().get_field(field_name, &args).map(|(typ, _)| typ)
-            }
+            Type::DataType(def, args) => def
+                .borrow()
+                .get_field(field_name, &args)
+                .map(|(typ, visibility, _)| (typ, visibility)),
             Type::Tuple(fields) => {
                 let mut fields = fields.into_iter().enumerate();
-                fields.find(|(i, _)| i.to_string() == *field_name).map(|(_, typ)| typ)
+                fields
+                    .find(|(i, _)| i.to_string() == *field_name)
+                    .map(|(_, typ)| (typ, ItemVisibility::Public))
             }
             _ => None,
         }
@@ -1919,7 +2294,11 @@ impl Type {
     ) -> (Type, TypeBindings) {
         match self {
             Type::Forall(typevars, typ) => {
-                assert_eq!(types.len() + implicit_generic_count, typevars.len(), "Turbofish operator used with incorrect generic count which was not caught by name resolution");
+                assert_eq!(
+                    types.len() + implicit_generic_count,
+                    typevars.len(),
+                    "Turbofish operator used with incorrect generic count which was not caught by name resolution"
+                );
 
                 let bindings =
                     (0..implicit_generic_count).map(|_| interner.next_type_variable()).chain(types);
@@ -2035,16 +2414,22 @@ impl Type {
                 let fields = fields.substitute_helper(type_bindings, substitute_bound_typevars);
                 Type::FmtString(Box::new(size), Box::new(fields))
             }
+            Type::CheckedCast { from, to } => {
+                let from = from.substitute_helper(type_bindings, substitute_bound_typevars);
+                let to = to.substitute_helper(type_bindings, substitute_bound_typevars);
+                Type::CheckedCast { from: Box::new(from), to: Box::new(to) }
+            }
             Type::NamedGeneric(binding, _) | Type::TypeVariable(binding) => {
                 substitute_binding(binding)
             }
+
             // Do not substitute_helper fields, it can lead to infinite recursion
             // and we should not match fields when type checking anyway.
-            Type::Struct(fields, args) => {
+            Type::DataType(fields, args) => {
                 let args = vecmap(args, |arg| {
                     arg.substitute_helper(type_bindings, substitute_bound_typevars)
                 });
-                Type::Struct(fields.clone(), args)
+                Type::DataType(fields.clone(), args)
             }
             Type::Alias(alias, args) => {
                 let args = vecmap(args, |arg| {
@@ -2089,10 +2474,10 @@ impl Type {
                 });
                 Type::TraitAsType(*s, name.clone(), TraitGenerics { ordered, named })
             }
-            Type::InfixExpr(lhs, op, rhs) => {
+            Type::InfixExpr(lhs, op, rhs, inversion) => {
                 let lhs = lhs.substitute_helper(type_bindings, substitute_bound_typevars);
                 let rhs = rhs.substitute_helper(type_bindings, substitute_bound_typevars);
-                Type::InfixExpr(Box::new(lhs), *op, Box::new(rhs))
+                Type::InfixExpr(Box::new(lhs), *op, Box::new(rhs), *inversion)
             }
 
             Type::FieldElement
@@ -2116,7 +2501,7 @@ impl Type {
                 let field_occurs = fields.occurs(target_id);
                 len_occurs || field_occurs
             }
-            Type::Struct(_, generic_args) | Type::Alias(_, generic_args) => {
+            Type::DataType(_, generic_args) | Type::Alias(_, generic_args) => {
                 generic_args.iter().any(|arg| arg.occurs(target_id))
             }
             Type::TraitAsType(_, _, args) => {
@@ -2124,6 +2509,7 @@ impl Type {
                     || args.named.iter().any(|arg| arg.typ.occurs(target_id))
             }
             Type::Tuple(fields) => fields.iter().any(|field| field.occurs(target_id)),
+            Type::CheckedCast { from, to } => from.occurs(target_id) || to.occurs(target_id),
             Type::NamedGeneric(type_var, _) | Type::TypeVariable(type_var) => {
                 match &*type_var.borrow() {
                     TypeBinding::Bound(binding) => {
@@ -2141,7 +2527,7 @@ impl Type {
                     || env.occurs(target_id)
             }
             Type::MutableReference(element) => element.occurs(target_id),
-            Type::InfixExpr(lhs, _op, rhs) => lhs.occurs(target_id) || rhs.occurs(target_id),
+            Type::InfixExpr(lhs, _op, rhs, _) => lhs.occurs(target_id) || rhs.occurs(target_id),
 
             Type::FieldElement
             | Type::Integer(_, _)
@@ -2172,9 +2558,9 @@ impl Type {
                 let args = Box::new(args.follow_bindings());
                 FmtString(size, args)
             }
-            Struct(def, args) => {
+            DataType(def, args) => {
                 let args = vecmap(args, |arg| arg.follow_bindings());
-                Struct(def.clone(), args)
+                DataType(def.clone(), args)
             }
             Alias(def, args) => {
                 // We don't need to vecmap(args, follow_bindings) since we're recursively
@@ -2182,13 +2568,17 @@ impl Type {
                 def.borrow().get_type(args).follow_bindings()
             }
             Tuple(args) => Tuple(vecmap(args, |arg| arg.follow_bindings())),
+            CheckedCast { from, to } => {
+                let from = Box::new(from.follow_bindings());
+                let to = Box::new(to.follow_bindings());
+                CheckedCast { from, to }
+            }
             TypeVariable(var) | NamedGeneric(var, _) => {
                 if let TypeBinding::Bound(typ) = &*var.borrow() {
                     return typ.follow_bindings();
                 }
                 self.clone()
             }
-
             Function(args, ret, env, unconstrained) => {
                 let args = vecmap(args, |arg| arg.follow_bindings());
                 let ret = Box::new(ret.follow_bindings());
@@ -2206,10 +2596,10 @@ impl Type {
                 });
                 TraitAsType(*s, name.clone(), TraitGenerics { ordered, named })
             }
-            InfixExpr(lhs, op, rhs) => {
+            InfixExpr(lhs, op, rhs, inversion) => {
                 let lhs = lhs.follow_bindings();
                 let rhs = rhs.follow_bindings();
-                InfixExpr(Box::new(lhs), *op, Box::new(rhs))
+                InfixExpr(Box::new(lhs), *op, Box::new(rhs), *inversion)
             }
 
             // Expect that this function should only be called on instantiated types
@@ -2217,6 +2607,25 @@ impl Type {
             FieldElement | Integer(_, _) | Bool | Constant(_, _) | Unit | Quoted(_) | Error => {
                 self.clone()
             }
+        }
+    }
+
+    /// Follow bindings if this is a type variable or generic to the first non-typevariable
+    /// type. Unlike `follow_bindings`, this won't recursively follow any bindings on any
+    /// fields or arguments of this type.
+    pub fn follow_bindings_shallow(&self) -> Cow<Type> {
+        match self {
+            Type::TypeVariable(var) | Type::NamedGeneric(var, _) => {
+                if let TypeBinding::Bound(typ) = &*var.borrow() {
+                    return Cow::Owned(typ.follow_bindings_shallow().into_owned());
+                }
+                Cow::Borrowed(self)
+            }
+            Type::Alias(alias_def, generics) => {
+                let typ = alias_def.borrow().get_type(generics);
+                Cow::Owned(typ.follow_bindings_shallow().into_owned())
+            }
+            other => Cow::Borrowed(other),
         }
     }
 
@@ -2253,7 +2662,7 @@ impl Type {
                     field.replace_named_generics_with_type_variables();
                 }
             }
-            Type::Struct(_, generics) => {
+            Type::DataType(_, generics) => {
                 for generic in generics {
                     generic.replace_named_generics_with_type_variables();
                 }
@@ -2279,6 +2688,10 @@ impl Type {
                     generic.typ.replace_named_generics_with_type_variables();
                 }
             }
+            Type::CheckedCast { from, to } => {
+                from.replace_named_generics_with_type_variables();
+                to.replace_named_generics_with_type_variables();
+            }
             Type::NamedGeneric(var, _) => {
                 let type_binding = var.borrow();
                 if let TypeBinding::Bound(binding) = &*type_binding {
@@ -2300,7 +2713,7 @@ impl Type {
             }
             Type::MutableReference(elem) => elem.replace_named_generics_with_type_variables(),
             Type::Forall(_, typ) => typ.replace_named_generics_with_type_variables(),
-            Type::InfixExpr(lhs, _op, rhs) => {
+            Type::InfixExpr(lhs, _op, rhs, _) => {
                 lhs.replace_named_generics_with_type_variables();
                 rhs.replace_named_generics_with_type_variables();
             }
@@ -2311,6 +2724,53 @@ impl Type {
         match self {
             Type::Slice(element) => Some(element),
             _ => None,
+        }
+    }
+
+    pub(crate) fn integral_maximum_size(&self) -> Option<FieldElement> {
+        match self {
+            Type::FieldElement => None,
+            Type::Integer(sign, num_bits) => {
+                let mut max_bit_size = num_bits.bit_size();
+                if sign == &Signedness::Signed {
+                    max_bit_size -= 1;
+                }
+                let max = if max_bit_size == 128 { u128::MAX } else { (1u128 << max_bit_size) - 1 };
+                Some(max.into())
+            }
+            Type::Bool => Some(FieldElement::one()),
+            Type::TypeVariable(var) => {
+                let binding = &var.1;
+                match &*binding.borrow() {
+                    TypeBinding::Unbound(_, type_var_kind) => match type_var_kind {
+                        Kind::Any | Kind::Normal | Kind::Integer | Kind::IntegerOrField => None,
+                        Kind::Numeric(typ) => typ.integral_maximum_size(),
+                    },
+                    TypeBinding::Bound(typ) => typ.integral_maximum_size(),
+                }
+            }
+            Type::Alias(alias, args) => alias.borrow().get_type(args).integral_maximum_size(),
+            Type::CheckedCast { to, .. } => to.integral_maximum_size(),
+            Type::NamedGeneric(binding, _name) => match &*binding.borrow() {
+                TypeBinding::Bound(typ) => typ.integral_maximum_size(),
+                TypeBinding::Unbound(_, kind) => kind.integral_maximum_size(),
+            },
+            Type::MutableReference(typ) => typ.integral_maximum_size(),
+            Type::InfixExpr(lhs, _op, rhs, _) => lhs.infix_kind(rhs).integral_maximum_size(),
+            Type::Constant(_, kind) => kind.integral_maximum_size(),
+
+            Type::Array(..)
+            | Type::Slice(..)
+            | Type::String(..)
+            | Type::FmtString(..)
+            | Type::Unit
+            | Type::Tuple(..)
+            | Type::DataType(..)
+            | Type::TraitAsType(..)
+            | Type::Function(..)
+            | Type::Forall(..)
+            | Type::Quoted(..)
+            | Type::Error => None,
         }
     }
 }
@@ -2333,14 +2793,14 @@ fn convert_array_expression_to_slice(
     let argument = interner.expression(&expression);
     let argument = interner.push_expr(argument);
     interner.push_expr_type(argument, array_type.clone());
-    interner.push_expr_location(argument, location.span, location.file);
+    interner.push_expr_location(argument, location);
 
     let arguments = vec![argument];
     let is_macro_call = false;
     let call = HirExpression::Call(HirCallExpression { func, arguments, location, is_macro_call });
     interner.replace_expr(&expression, call);
 
-    interner.push_expr_location(func, location.span, location.file);
+    interner.push_expr_location(func, location);
     interner.push_expr_type(expression, target_type.clone());
 
     let func_type =
@@ -2350,15 +2810,40 @@ fn convert_array_expression_to_slice(
 
 impl BinaryTypeOperator {
     /// Perform the actual rust numeric operation associated with this operator
-    // TODO(https://github.com/noir-lang/noir/pull/6137): the Kind is included
-    // since it'll be needed for size checks
-    pub fn function(self, a: u32, b: u32, _kind: &Kind) -> Option<u32> {
-        match self {
-            BinaryTypeOperator::Addition => a.checked_add(b),
-            BinaryTypeOperator::Subtraction => a.checked_sub(b),
-            BinaryTypeOperator::Multiplication => a.checked_mul(b),
-            BinaryTypeOperator::Division => a.checked_div(b),
-            BinaryTypeOperator::Modulo => a.checked_rem(b),
+    pub fn function(
+        self,
+        a: FieldElement,
+        b: FieldElement,
+        kind: &Kind,
+        location: Location,
+    ) -> Result<FieldElement, TypeCheckError> {
+        match kind.follow_bindings().integral_maximum_size() {
+            None => match self {
+                BinaryTypeOperator::Addition => Ok(a + b),
+                BinaryTypeOperator::Subtraction => Ok(a - b),
+                BinaryTypeOperator::Multiplication => Ok(a * b),
+                BinaryTypeOperator::Division => (b != FieldElement::zero())
+                    .then(|| a / b)
+                    .ok_or(TypeCheckError::DivisionByZero { lhs: a, rhs: b, location }),
+                BinaryTypeOperator::Modulo => {
+                    Err(TypeCheckError::ModuloOnFields { lhs: a, rhs: b, location })
+                }
+            },
+            Some(_maximum_size) => {
+                let a = a.to_i128();
+                let b = b.to_i128();
+
+                let err = TypeCheckError::FailingBinaryOp { op: self, lhs: a, rhs: b, location };
+                let result = match self {
+                    BinaryTypeOperator::Addition => a.checked_add(b).ok_or(err)?,
+                    BinaryTypeOperator::Subtraction => a.checked_sub(b).ok_or(err)?,
+                    BinaryTypeOperator::Multiplication => a.checked_mul(b).ok_or(err)?,
+                    BinaryTypeOperator::Division => a.checked_div(b).ok_or(err)?,
+                    BinaryTypeOperator::Modulo => a.checked_rem(b).ok_or(err)?,
+                };
+
+                Ok(result.into())
+            }
         }
     }
 
@@ -2368,6 +2853,17 @@ impl BinaryTypeOperator {
 
     /// Return the operator that will "undo" this operation if applied to the rhs
     fn inverse(self) -> Option<BinaryTypeOperator> {
+        match self {
+            BinaryTypeOperator::Addition => Some(BinaryTypeOperator::Subtraction),
+            BinaryTypeOperator::Subtraction => Some(BinaryTypeOperator::Addition),
+            BinaryTypeOperator::Multiplication => None,
+            BinaryTypeOperator::Division => None,
+            BinaryTypeOperator::Modulo => None,
+        }
+    }
+
+    /// Return the operator that will "undo" this operation if applied to the rhs
+    fn approx_inverse(self) -> Option<BinaryTypeOperator> {
         match self {
             BinaryTypeOperator::Addition => Some(BinaryTypeOperator::Subtraction),
             BinaryTypeOperator::Subtraction => Some(BinaryTypeOperator::Addition),
@@ -2391,7 +2887,10 @@ impl From<&Type> for PrintableType {
         match value {
             Type::FieldElement => PrintableType::Field,
             Type::Array(size, typ) => {
-                let length = size.evaluate_to_u32().expect("Cannot print variable sized arrays");
+                let dummy_location = Location::dummy();
+                let length = size
+                    .evaluate_to_u32(dummy_location)
+                    .expect("Cannot print variable sized arrays");
                 let typ = typ.as_ref();
                 PrintableType::Array { length, typ: Box::new(typ.into()) }
             }
@@ -2416,22 +2915,35 @@ impl From<&Type> for PrintableType {
             },
             Type::Bool => PrintableType::Boolean,
             Type::String(size) => {
-                let size = size.evaluate_to_u32().expect("Cannot print variable sized strings");
+                let dummy_location = Location::dummy();
+                let size = size
+                    .evaluate_to_u32(dummy_location)
+                    .expect("Cannot print variable sized strings");
                 PrintableType::String { length: size }
             }
             Type::FmtString(_, _) => unreachable!("format strings cannot be printed"),
             Type::Error => unreachable!(),
             Type::Unit => PrintableType::Unit,
             Type::Constant(_, _) => unreachable!(),
-            Type::Struct(def, ref args) => {
-                let struct_type = def.borrow();
-                let fields = struct_type.get_fields(args);
-                let fields = vecmap(fields, |(name, typ)| (name, typ.into()));
-                PrintableType::Struct { fields, name: struct_type.name.to_string() }
+            Type::DataType(def, ref args) => {
+                let data_type = def.borrow();
+                let name = data_type.name.to_string();
+
+                if let Some(fields) = data_type.get_fields(args) {
+                    let fields = vecmap(fields, |(name, typ)| (name, typ.into()));
+                    PrintableType::Struct { fields, name }
+                } else if let Some(variants) = data_type.get_variants(args) {
+                    let variants =
+                        vecmap(variants, |(name, args)| (name, vecmap(args, Into::into)));
+                    PrintableType::Enum { name, variants }
+                } else {
+                    unreachable!()
+                }
             }
             Type::Alias(alias, args) => alias.borrow().get_type(args).into(),
             Type::TraitAsType(..) => unreachable!(),
             Type::Tuple(types) => PrintableType::Tuple { types: vecmap(types, |typ| typ.into()) },
+            Type::CheckedCast { to, .. } => to.as_ref().into(),
             Type::NamedGeneric(..) => unreachable!(),
             Type::Forall(..) => unreachable!(),
             Type::Function(arguments, return_type, env, unconstrained) => PrintableType::Function {
@@ -2478,7 +2990,7 @@ impl std::fmt::Debug for Type {
                     write!(f, "{}", binding.borrow())
                 }
             }
-            Type::Struct(s, args) => {
+            Type::DataType(s, args) => {
                 let args = vecmap(args, |arg| format!("{:?}", arg));
                 if args.is_empty() {
                     write!(f, "{}", s.borrow())
@@ -2506,6 +3018,7 @@ impl std::fmt::Debug for Type {
             }
             Type::Unit => write!(f, "()"),
             Type::Error => write!(f, "error"),
+            Type::CheckedCast { to, .. } => write!(f, "{:?}", to),
             Type::NamedGeneric(binding, name) => match binding.kind() {
                 Kind::Any | Kind::Normal | Kind::Integer | Kind::IntegerOrField => {
                     write!(f, "{}{:?}", name, binding)
@@ -2537,7 +3050,7 @@ impl std::fmt::Debug for Type {
                 write!(f, "&mut {element:?}")
             }
             Type::Quoted(quoted) => write!(f, "{}", quoted),
-            Type::InfixExpr(lhs, op, rhs) => write!(f, "({lhs:?} {op} {rhs:?})"),
+            Type::InfixExpr(lhs, op, rhs, _) => write!(f, "({lhs:?} {op} {rhs:?})"),
         }
     }
 }
@@ -2559,7 +3072,7 @@ impl std::fmt::Debug for TypeVariable {
     }
 }
 
-impl std::fmt::Debug for StructType {
+impl std::fmt::Debug for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
     }
@@ -2596,7 +3109,7 @@ impl std::hash::Hash for Type {
                 env.hash(state);
             }
             Type::Tuple(elems) => elems.hash(state),
-            Type::Struct(def, args) => {
+            Type::DataType(def, args) => {
                 def.hash(state);
                 args.hash(state);
             }
@@ -2620,9 +3133,10 @@ impl std::hash::Hash for Type {
                 vars.hash(state);
                 typ.hash(state);
             }
+            Type::CheckedCast { to, .. } => to.hash(state),
             Type::Constant(value, _) => value.hash(state),
             Type::Quoted(typ) => typ.hash(state),
-            Type::InfixExpr(lhs, op, rhs) => {
+            Type::InfixExpr(lhs, op, rhs, _) => {
                 lhs.hash(state);
                 op.hash(state);
                 rhs.hash(state);
@@ -2666,7 +3180,7 @@ impl PartialEq for Type {
                 lhs_len == rhs_len && lhs_env == rhs_env
             }
             (Tuple(lhs_types), Tuple(rhs_types)) => lhs_types == rhs_types,
-            (Struct(lhs_struct, lhs_generics), Struct(rhs_struct, rhs_generics)) => {
+            (DataType(lhs_struct, lhs_generics), DataType(rhs_struct, rhs_generics)) => {
                 lhs_struct == rhs_struct && lhs_generics == rhs_generics
             }
             (Alias(lhs_alias, lhs_generics), Alias(rhs_alias, rhs_generics)) => {
@@ -2686,11 +3200,12 @@ impl PartialEq for Type {
             (Forall(lhs_vars, lhs_type), Forall(rhs_vars, rhs_type)) => {
                 lhs_vars == rhs_vars && lhs_type == rhs_type
             }
+            (CheckedCast { to, .. }, other) | (other, CheckedCast { to, .. }) => **to == *other,
             (Constant(lhs, lhs_kind), Constant(rhs, rhs_kind)) => {
                 lhs == rhs && lhs_kind == rhs_kind
             }
             (Quoted(lhs), Quoted(rhs)) => lhs == rhs,
-            (InfixExpr(l_lhs, l_op, l_rhs), InfixExpr(r_lhs, r_op, r_rhs)) => {
+            (InfixExpr(l_lhs, l_op, l_rhs, _), InfixExpr(r_lhs, r_op, r_rhs, _)) => {
                 l_lhs == r_lhs && l_op == r_op && l_rhs == r_rhs
             }
             // Special case: we consider unbound named generics and type variables to be equal to each

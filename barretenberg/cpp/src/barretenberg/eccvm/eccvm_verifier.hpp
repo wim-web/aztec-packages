@@ -22,10 +22,18 @@ class ECCVMVerifier {
     explicit ECCVMVerifier(const std::shared_ptr<ECCVMVerifier::ProvingKey>& proving_key)
         : ECCVMVerifier(std::make_shared<ECCVMFlavor::VerificationKey>(proving_key)){};
 
-    bool verify_proof(const HonkProof& proof);
+    bool verify_proof(const ECCVMProof& proof);
+    OpeningClaim<typename ECCVMFlavor::Curve> compute_translation_opening_claim(
+        const std::array<Commitment, NUM_TRANSLATION_EVALUATIONS>& translation_commitments);
 
+    std::array<Commitment, NUM_TRANSLATION_EVALUATIONS> translation_commitments;
     std::shared_ptr<VerificationKey> key;
     std::map<std::string, Commitment> commitments;
     std::shared_ptr<Transcript> transcript;
+    std::shared_ptr<Transcript> ipa_transcript;
+
+    // Translation evaluation and batching challenges. They are propagated to the TranslatorVerifier
+    FF evaluation_challenge_x;
+    FF batching_challenge_v;
 };
 } // namespace bb

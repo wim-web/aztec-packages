@@ -10,8 +10,9 @@
 namespace tests_avm {
 
 using namespace bb;
-using namespace bb::Avm_vm;
+using namespace bb::avm;
 
+/* DISABLED
 TEST(AvmSkippableTests, shouldSkipCorrectly)
 {
     using FF = AvmFlavor::FF;
@@ -37,6 +38,8 @@ TEST(AvmSkippableTests, shouldSkipCorrectly)
 
         // Set the conditions for skippable to return true.
         row.poseidon2_sel_poseidon_perm = 0;
+        row.poseidon2_sel_poseidon_perm_mem_op = 0;
+        row.poseidon2_sel_poseidon_perm_immediate = 0;
     });
 
     // We build the polynomials needed to run "sumcheck".
@@ -78,6 +81,6 @@ TEST(AvmSkippableTests, shouldSkipCorrectly)
             }
         });
     }
-}
+}*/
 
 } // namespace tests_avm

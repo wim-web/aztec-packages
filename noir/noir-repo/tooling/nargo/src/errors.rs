@@ -16,8 +16,9 @@ use noirc_errors::{
 pub use noirc_errors::Location;
 
 use noirc_driver::CrateName;
-use noirc_printable_type::ForeignCallError;
 use thiserror::Error;
+
+use crate::foreign_calls::ForeignCallError;
 
 /// Errors covering situations where a package cannot be compiled.
 #[derive(Debug, Error)]
@@ -240,6 +241,6 @@ pub fn try_to_diagnose_runtime_error(
     // of the call stack (the last item in the Vec).
     let location = *source_locations.last()?;
     let message = extract_message_from_error(&abi.error_types, nargo_err);
-    let error = CustomDiagnostic::simple_error(message, String::new(), location.span);
+    let error = CustomDiagnostic::simple_error(message, String::new(), location);
     Some(error.with_call_stack(source_locations).in_file(location.file))
 }

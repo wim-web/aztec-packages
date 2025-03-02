@@ -1,5 +1,5 @@
 #include "./translator_recursive_verifier.hpp"
-#include "barretenberg/commitment_schemes/zeromorph/zeromorph.hpp"
+#include "barretenberg/commitment_schemes/shplonk/shplemini.hpp"
 #include "barretenberg/common/throw_or_abort.hpp"
 #include "barretenberg/relations/translator_vm/translator_decomposition_relation_impl.hpp"
 #include "barretenberg/relations/translator_vm/translator_delta_range_constraint_relation_impl.hpp"
@@ -57,19 +57,20 @@ void TranslatorRecursiveVerifier_<Flavor>::put_translation_data_in_relation_para
  * @brief This function verifies an TranslatorFlavor Honk proof for given program settings.
  */
 template <typename Flavor>
-std::array<typename Flavor::GroupElement, 2> TranslatorRecursiveVerifier_<Flavor>::verify_proof(const HonkProof& proof)
+std::array<typename Flavor::GroupElement, 2> TranslatorRecursiveVerifier_<Flavor>::verify_proof(
+    const HonkProof& proof, const BF& evaluation_input_x, const BF& batching_challenge_v)
 {
     using Sumcheck = ::bb::SumcheckVerifier<Flavor>;
     using PCS = typename Flavor::PCS;
     using Curve = typename Flavor::Curve;
-    using ZeroMorph = ::bb::ZeroMorphVerifier_<Curve>;
+    using Shplemini = ::bb::ShpleminiVerifier_<Curve>;
     using VerifierCommitments = typename Flavor::VerifierCommitments;
     using CommitmentLabels = typename Flavor::CommitmentLabels;
+    using ClaimBatcher = ClaimBatcher_<Curve>;
+    using ClaimBatch = ClaimBatcher::Batch;
 
-    StdlibProof<Builder> stdlib_proof = bb::convert_proof_to_witness(builder, proof);
+    StdlibProof<Builder> stdlib_proof = bb::convert_native_proof_to_stdlib(builder, proof);
     transcript->load_proof(stdlib_proof);
-
-    batching_challenge_v = transcript->template get_challenge<BF>("Translation:batching_challenge");
 
     VerifierCommitments commitments{ key };
     CommitmentLabels commitment_labels;
@@ -79,7 +80,6 @@ std::array<typename Flavor::GroupElement, 2> TranslatorRecursiveVerifier_<Flavor
         throw_or_abort(
             "TranslatorRecursiveVerifier::verify_proof: proof circuit size does not match verification key!");
     }
-    evaluation_input_x = transcript->template receive_from_prover<BF>("evaluation_input_x");
 
     const BF accumulated_result = transcript->template receive_from_prover<BF>("accumulated_result");
 
@@ -106,28 +106,43 @@ std::array<typename Flavor::GroupElement, 2> TranslatorRecursiveVerifier_<Flavor
     const size_t log_circuit_size = numeric::get_msb(static_cast<uint32_t>(circuit_size.get_value()));
     auto sumcheck = Sumcheck(log_circuit_size, transcript);
     FF alpha = transcript->template get_challenge<FF>("Sumcheck:alpha");
-    std::vector<FF> gate_challenges(log_circuit_size);
+    std::vector<FF> gate_challenges(CONST_PROOF_SIZE_LOG_N);
     for (size_t idx = 0; idx < gate_challenges.size(); idx++) {
         gate_challenges[idx] = transcript->template get_challenge<FF>("Sumcheck:gate_challenge_" + std::to_string(idx));
     }
 
-    auto [multivariate_challenge, claimed_evaluations, sumcheck_verified] =
-        sumcheck.verify(relation_parameters, alpha, gate_challenges);
+    std::array<Commitment, NUM_LIBRA_COMMITMENTS> libra_commitments = {};
+    libra_commitments[0] = transcript->template receive_from_prover<Commitment>("Libra:concatenation_commitment");
 
-    // Execute ZeroMorph rounds followed by the univariate PCS. See https://hackmd.io/dlf9xEwhTQyE3hiGbq4FsA?view for a
-    // complete description of the unrolled protocol.
+    auto sumcheck_output = sumcheck.verify(relation_parameters, alpha, gate_challenges);
 
-    auto opening_claim = ZeroMorph::verify(circuit_size,
-                                           commitments.get_unshifted_without_concatenated(),
-                                           commitments.get_to_be_shifted(),
-                                           claimed_evaluations.get_unshifted_without_concatenated(),
-                                           claimed_evaluations.get_shifted(),
-                                           multivariate_challenge,
-                                           Commitment::one(builder),
-                                           transcript,
-                                           commitments.get_groups_to_be_concatenated(),
-                                           claimed_evaluations.get_concatenated());
-    auto pairing_points = PCS::reduce_verify(opening_claim, transcript);
+    libra_commitments[1] = transcript->template receive_from_prover<Commitment>("Libra:grand_sum_commitment");
+    libra_commitments[2] = transcript->template receive_from_prover<Commitment>("Libra:quotient_commitment");
+
+    // Execute Shplemini
+    bool consistency_checked = true;
+    ClaimBatcher claim_batcher{
+        .unshifted = ClaimBatch{ commitments.get_unshifted_without_concatenated(),
+                                 sumcheck_output.claimed_evaluations.get_unshifted_without_concatenated() },
+        .shifted = ClaimBatch{ commitments.get_to_be_shifted(), sumcheck_output.claimed_evaluations.get_shifted() }
+    };
+    const BatchOpeningClaim<Curve> opening_claim =
+        Shplemini::compute_batch_opening_claim(circuit_size,
+                                               claim_batcher,
+                                               sumcheck_output.challenge,
+                                               Commitment::one(builder),
+                                               transcript,
+                                               Flavor::REPEATED_COMMITMENTS,
+                                               Flavor::HasZK,
+                                               &consistency_checked,
+                                               libra_commitments,
+                                               sumcheck_output.claimed_libra_evaluation,
+                                               {},
+                                               {},
+                                               commitments.get_groups_to_be_concatenated(),
+                                               sumcheck_output.claimed_evaluations.get_concatenated());
+
+    const auto pairing_points = PCS::reduce_verify_batch_opening_claim(opening_claim, transcript);
 
     return pairing_points;
 }
@@ -139,8 +154,7 @@ bool TranslatorRecursiveVerifier_<Flavor>::verify_translation(
         typename Flavor::FF>& translation_evaluations)
 {
     const auto reconstruct_from_array = [&](const auto& arr) {
-        const BF reconstructed = BF(arr[0], arr[1], arr[2], arr[3]);
-        return reconstructed;
+        return BF::construct_from_limbs(arr[0], arr[1], arr[2], arr[3]);
     };
 
     const auto& reconstruct_value_from_eccvm_evaluations = [&](const TranslationEvaluations& translation_evaluations,

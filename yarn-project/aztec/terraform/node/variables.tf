@@ -16,7 +16,7 @@ variable "FORK_ADMIN_API_KEY" {
   default = ""
 }
 
-variable "ETHEREUM_HOST" {
+variable "ETHEREUM_HOSTS" {
   type    = string
   default = ""
 }
@@ -63,11 +63,6 @@ variable "SEQ_MAX_SECONDS_BETWEEN_BLOCKS" {
 variable "SEQ_MIN_SECONDS_BETWEEN_BLOCKS" {
   type    = string
   default = 0
-}
-
-variable "P2P_MIN_PEERS" {
-  type    = string
-  default = 5
 }
 
 variable "P2P_MAX_PEERS" {

@@ -1,6 +1,6 @@
-import { InboxLeaf } from '@aztec/circuit-types';
-import { L1_TO_L2_MSG_SUBTREE_HEIGHT } from '@aztec/circuits.js/constants';
-import { type Fr } from '@aztec/foundation/fields';
+import { L1_TO_L2_MSG_SUBTREE_HEIGHT } from '@aztec/constants';
+import type { Fr } from '@aztec/foundation/fields';
+import { InboxLeaf } from '@aztec/stdlib/messaging';
 
 /**
  * A simple in-memory implementation of an L1 to L2 message store.
@@ -46,19 +46,14 @@ export class L1ToL2MessageStore {
   }
 
   /**
-   * Gets the first L1 to L2 message index in the L1 to L2 message tree which is greater than or equal to `startIndex`.
+   * Gets the L1 to L2 message index in the L1 to L2 message tree.
    * @param l1ToL2Message - The L1 to L2 message.
-   * @param startIndex - The index to start searching from.
    * @returns The index of the L1 to L2 message in the L1 to L2 message tree (undefined if not found).
    */
-  getMessageIndex(l1ToL2Message: Fr, startIndex: bigint): bigint | undefined {
+  getMessageIndex(l1ToL2Message: Fr): bigint | undefined {
     for (const [key, message] of this.store.entries()) {
       if (message.equals(l1ToL2Message)) {
-        const indexInTheWholeTree = BigInt(key);
-        if (indexInTheWholeTree < startIndex) {
-          continue;
-        }
-        return indexInTheWholeTree;
+        return BigInt(key);
       }
     }
     return undefined;

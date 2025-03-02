@@ -1,45 +1,32 @@
 use dep::aztec::{
-    prelude::{NullifiableNote, PrivateContext},
-    protocol_types::{constants::GENERATOR_INDEX__NOTE_NULLIFIER, hash::poseidon2_hash_with_separator},
-    note::utils::compute_note_hash_for_nullify, keys::getters::get_nsk_app, macros::notes::note
+    macros::notes::partial_note,
+    oracle::random::random,
+    protocol_types::{address::AztecAddress, traits::Serialize},
 };
 
-#[note]
+// docs:start:UintNote
+// We derive the Serialize trait because in some cases notes are used as parameters to contract functions.
+#[partial_note(quote {value})]
+#[derive(Eq, Serialize)]
 pub struct UintNote {
-    // The integer stored by the note
-    value: U128,
-    // The nullifying public key hash is used with the nsk_app to ensure that the note can be privately spent.
-    npk_m_hash: Field,
-    // Randomness of the note to hide its contents
+    // The amount of tokens in the note
+    value: u128,
+    owner: AztecAddress,
+    // Randomness of the note to protect against note hash preimage attacks
     randomness: Field,
 }
-
-impl NullifiableNote for UintNote {
-    fn compute_nullifier(self, context: &mut PrivateContext, note_hash_for_nullify: Field) -> Field {
-        let secret = context.request_nsk_app(self.npk_m_hash);
-        poseidon2_hash_with_separator(
-            [
-            note_hash_for_nullify,
-            secret
-        ],
-            GENERATOR_INDEX__NOTE_NULLIFIER as Field
-        )
+// docs:end:UintNote
+impl UintNote {
+    pub fn new(value: u128, owner: AztecAddress) -> Self {
+        // Safety: We use the randomness to preserve the privacy of the note recipient by preventing brute-forcing,
+        // so a malicious sender could use non-random values to make the note less private. But they already know
+        // the full note pre-image anyway, and so the recipient already trusts them to not disclose this
+        // information. We can therefore assume that the sender will cooperate in the random value generation.
+        let randomness = unsafe { random() };
+        Self { value, owner, randomness }
     }
 
-    unconstrained fn compute_nullifier_without_context(self) -> Field {
-        let note_hash_for_nullify = compute_note_hash_for_nullify(self);
-        let secret = get_nsk_app(self.npk_m_hash);
-        poseidon2_hash_with_separator(
-            [note_hash_for_nullify, secret],
-            GENERATOR_INDEX__NOTE_NULLIFIER
-        )
-    }
-}
-
-impl Eq for UintNote {
-    fn eq(self, other: Self) -> bool {
-        (self.value == other.value)
-            & (self.npk_m_hash == other.npk_m_hash)
-            & (self.randomness == other.randomness)
+    pub fn get_value(self) -> u128 {
+        self.value
     }
 }

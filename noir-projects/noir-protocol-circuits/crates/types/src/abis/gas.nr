@@ -1,12 +1,13 @@
 use crate::{
-    constants::{GAS_LENGTH, FIXED_DA_GAS, FIXED_L2_GAS}, traits::{Deserialize, Serialize, Empty},
-    abis::gas_fees::GasFees
+    abis::gas_fees::GasFees,
+    constants::{FIXED_DA_GAS, FIXED_L2_GAS, GAS_LENGTH},
+    traits::{Deserialize, Empty, Serialize},
 };
 use std::ops::{Add, Sub};
 
 pub struct Gas {
-    da_gas: u32,
-    l2_gas: u32,
+    pub da_gas: u32,
+    pub l2_gas: u32,
 }
 
 impl Gas {

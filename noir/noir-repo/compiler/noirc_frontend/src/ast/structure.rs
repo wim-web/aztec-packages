@@ -4,7 +4,7 @@ use crate::ast::{Ident, UnresolvedGenerics, UnresolvedType};
 use crate::token::SecondaryAttribute;
 
 use iter_extended::vecmap;
-use noirc_errors::Span;
+use noirc_errors::Location;
 
 use super::{Documented, ItemVisibility};
 
@@ -16,11 +16,18 @@ pub struct NoirStruct {
     pub visibility: ItemVisibility,
     pub generics: UnresolvedGenerics,
     pub fields: Vec<Documented<StructField>>,
-    pub span: Span,
+    pub location: Location,
+}
+
+impl NoirStruct {
+    pub fn is_abi(&self) -> bool {
+        self.attributes.iter().any(|attr| attr.is_abi())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructField {
+    pub visibility: ItemVisibility,
     pub name: Ident,
     pub typ: UnresolvedType,
 }

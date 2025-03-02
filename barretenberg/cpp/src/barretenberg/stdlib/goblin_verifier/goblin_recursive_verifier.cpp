@@ -8,17 +8,19 @@ namespace bb::stdlib::recursion::honk {
  * @todo https://github.com/AztecProtocol/barretenberg/issues/934: Add logic for accumulating the pairing points
  * produced by the translator and merge verifier (and potentially IPA accumulators for ECCVM verifier)
  */
-void GoblinRecursiveVerifier::verify(const GoblinProof& proof)
+GoblinRecursiveVerifierOutput GoblinRecursiveVerifier::verify(const GoblinProof& proof)
 {
     // Run the ECCVM recursive verifier
     ECCVMVerifier eccvm_verifier{ builder, verification_keys.eccvm_verification_key };
-    eccvm_verifier.verify_proof(proof.eccvm_proof);
+    auto [opening_claim, ipa_transcript] = eccvm_verifier.verify_proof(proof.eccvm_proof);
 
     // Run the Translator recursive verifier
     TranslatorVerifier translator_verifier{ builder,
                                             verification_keys.translator_verification_key,
                                             eccvm_verifier.transcript };
-    translator_verifier.verify_proof(proof.translator_proof);
+
+    translator_verifier.verify_proof(
+        proof.translator_proof, eccvm_verifier.evaluation_challenge_x, eccvm_verifier.batching_challenge_v);
 
     // Verify the consistency between the ECCVM and Translator transcript polynomial evaluations
     // In reality the Goblin Proof is going to already be a stdlib proof and this conversion is not going to happen here
@@ -36,5 +38,6 @@ void GoblinRecursiveVerifier::verify(const GoblinProof& proof)
 
     MergeVerifier merge_verifier{ builder };
     merge_verifier.verify_proof(proof.merge_proof);
+    return { opening_claim, ipa_transcript };
 }
 } // namespace bb::stdlib::recursion::honk

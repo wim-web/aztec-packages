@@ -1,35 +1,28 @@
-import {
-  MerkleTreeId,
-  type MerkleTreeReadOperations,
-  type MerkleTreeWriteOperations,
-  NullifierMembershipWitness,
-  type Tx,
-} from '@aztec/circuit-types';
-import { type PublicDBAccessStats } from '@aztec/circuit-types/stats';
-import {
-  type AztecAddress,
-  type ContractClassPublic,
-  ContractClassRegisteredEvent,
-  type ContractDataSource,
-  ContractInstanceDeployedEvent,
-  type ContractInstanceWithAddress,
-  Fr,
-  FunctionSelector,
-  type L1_TO_L2_MSG_TREE_HEIGHT,
-  type NULLIFIER_TREE_HEIGHT,
-  type NullifierLeafPreimage,
-  type PublicDataTreeLeafPreimage,
-} from '@aztec/circuits.js';
-import { computeL1ToL2MessageNullifier, computePublicDataTreeLeafSlot } from '@aztec/circuits.js/hash';
-import { createDebugLogger } from '@aztec/foundation/log';
+import { Fr } from '@aztec/foundation/fields';
+import { createLogger } from '@aztec/foundation/log';
 import { Timer } from '@aztec/foundation/timer';
-import { ProtocolContractAddress } from '@aztec/protocol-contracts';
+import { ContractClassRegisteredEvent } from '@aztec/protocol-contracts/class-registerer';
+import { ContractInstanceDeployedEvent } from '@aztec/protocol-contracts/instance-deployer';
+import type { FunctionSelector } from '@aztec/stdlib/abi';
+import { PublicDataWrite } from '@aztec/stdlib/avm';
+import type { AztecAddress } from '@aztec/stdlib/aztec-address';
 import {
-  type CommitmentsDB,
-  MessageLoadOracleInputs,
-  type PublicContractsDB,
-  type PublicStateDB,
-} from '@aztec/simulator';
+  type ContractClassPublic,
+  type ContractDataSource,
+  type ContractInstanceWithAddress,
+  computePublicBytecodeCommitment,
+} from '@aztec/stdlib/contract';
+import { computePublicDataTreeLeafSlot } from '@aztec/stdlib/hash';
+import type {
+  MerkleTreeCheckpointOperations,
+  MerkleTreeReadOperations,
+  MerkleTreeWriteOperations,
+} from '@aztec/stdlib/interfaces/server';
+import type { PublicDBAccessStats } from '@aztec/stdlib/stats';
+import { MerkleTreeId, type PublicDataTreeLeafPreimage } from '@aztec/stdlib/trees';
+import type { Tx } from '@aztec/stdlib/tx';
+
+import type { PublicContractsDB, PublicStateDB } from '../common/db_interfaces.js';
 
 /**
  * Implements the PublicContractsDB using a ContractDataSource.
@@ -38,45 +31,67 @@ import {
 export class ContractsDataSourcePublicDB implements PublicContractsDB {
   private instanceCache = new Map<string, ContractInstanceWithAddress>();
   private classCache = new Map<string, ContractClassPublic>();
+  private bytecodeCommitmentCache = new Map<string, Fr>();
 
-  private log = createDebugLogger('aztec:sequencer:contracts-data-source');
+  private log = createLogger('simulator:contracts-data-source');
 
   constructor(private dataSource: ContractDataSource) {}
-
   /**
    * Add new contracts from a transaction
    * @param tx - The transaction to add contracts from.
    */
-  public addNewContracts(tx: Tx): Promise<void> {
+  public async addNewContracts(tx: Tx): Promise<void> {
     // Extract contract class and instance data from logs and add to cache for this block
-    const logs = tx.unencryptedLogs.unrollLogs();
-    ContractClassRegisteredEvent.fromLogs(logs, ProtocolContractAddress.ContractClassRegisterer).forEach(e => {
-      this.log.debug(`Adding class ${e.contractClassId.toString()} to public execution contract cache`);
-      this.classCache.set(e.contractClassId.toString(), e.toContractClassPublic());
-    });
-    ContractInstanceDeployedEvent.fromLogs(logs).forEach(e => {
+    const siloedLogs = await tx.filterContractClassLogs(tx.data.getNonEmptyContractClassLogsHashes(), true);
+    const contractClassRegisteredEvents = siloedLogs
+      .filter(log => ContractClassRegisteredEvent.isContractClassRegisteredEvent(log))
+      .map(log => ContractClassRegisteredEvent.fromLog(log));
+    await Promise.all(
+      contractClassRegisteredEvents.map(async event => {
+        this.log.debug(`Adding class ${event.contractClassId.toString()} to public execution contract cache`);
+        this.classCache.set(event.contractClassId.toString(), await event.toContractClassPublic());
+      }),
+    );
+
+    // We store the contract instance deployed event log in private logs, contract_instance_deployer_contract/src/main.nr
+    const contractInstanceEvents = tx.data
+      .getNonEmptyPrivateLogs()
+      .filter(log => ContractInstanceDeployedEvent.isContractInstanceDeployedEvent(log))
+      .map(ContractInstanceDeployedEvent.fromLog);
+    contractInstanceEvents.forEach(e => {
       this.log.debug(
         `Adding instance ${e.address.toString()} with class ${e.contractClassId.toString()} to public execution contract cache`,
       );
       this.instanceCache.set(e.address.toString(), e.toContractInstance());
     });
-
-    return Promise.resolve();
   }
 
   /**
    * Removes new contracts added from transactions
    * @param tx - The tx's contracts to be removed
+   * @param onlyRevertible - Whether to only remove contracts added from revertible contract class logs
    */
-  public removeNewContracts(tx: Tx): Promise<void> {
+  public async removeNewContracts(tx: Tx, onlyRevertible: boolean = false): Promise<void> {
     // TODO(@spalladino): Can this inadvertently delete a valid contract added by another tx?
     // Let's say we have two txs adding the same contract on the same block. If the 2nd one reverts,
     // wouldn't that accidentally remove the contract added on the first one?
-    const logs = tx.unencryptedLogs.unrollLogs();
-    ContractClassRegisteredEvent.fromLogs(logs, ProtocolContractAddress.ContractClassRegisterer).forEach(e =>
-      this.classCache.delete(e.contractClassId.toString()),
-    );
-    ContractInstanceDeployedEvent.fromLogs(logs).forEach(e => this.instanceCache.delete(e.address.toString()));
+    const contractClassLogs = onlyRevertible ? await tx.getSplitContractClassLogs(true, true) : tx.contractClassLogs;
+    contractClassLogs
+      .filter(log => ContractClassRegisteredEvent.isContractClassRegisteredEvent(log))
+      .forEach(log => {
+        const event = ContractClassRegisteredEvent.fromLog(log);
+        this.classCache.delete(event.contractClassId.toString());
+      });
+
+    // We store the contract instance deployed event log in private logs, contract_instance_deployer_contract/src/main.nr
+    const privateLogs = onlyRevertible
+      ? tx.data.forPublic!.revertibleAccumulatedData.privateLogs.filter(l => !l.isEmpty())
+      : tx.data.getNonEmptyPrivateLogs();
+    const contractInstanceEvents = privateLogs
+      .filter(log => ContractInstanceDeployedEvent.isContractInstanceDeployedEvent(log))
+      .map(ContractInstanceDeployedEvent.fromLog);
+    contractInstanceEvents.forEach(e => this.instanceCache.delete(e.address.toString()));
+
     return Promise.resolve();
   }
 
@@ -88,47 +103,69 @@ export class ContractsDataSourcePublicDB implements PublicContractsDB {
     return this.classCache.get(contractClassId.toString()) ?? (await this.dataSource.getContractClass(contractClassId));
   }
 
-  async getBytecode(address: AztecAddress, selector: FunctionSelector): Promise<Buffer | undefined> {
-    const instance = await this.getContractInstance(address);
-    if (!instance) {
-      throw new Error(`Contract ${address.toString()} not found`);
+  public async getBytecodeCommitment(contractClassId: Fr): Promise<Fr | undefined> {
+    // Try and retrieve from cache
+    const key = contractClassId.toString();
+    const result = this.bytecodeCommitmentCache.get(key);
+    if (result !== undefined) {
+      return result;
     }
-    const contractClass = await this.getContractClass(instance.contractClassId);
-    if (!contractClass) {
-      throw new Error(`Contract class ${instance.contractClassId.toString()} for ${address.toString()} not found`);
+    // Now try from the store
+    const fromStore = await this.dataSource.getBytecodeCommitment(contractClassId);
+    if (fromStore !== undefined) {
+      this.bytecodeCommitmentCache.set(key, fromStore);
+      return fromStore;
     }
-    return contractClass.publicFunctions.find(f => f.selector.equals(selector))?.bytecode;
+
+    // Not in either the store or the cache, build it here and cache
+    const contractClass = await this.getContractClass(contractClassId);
+    if (contractClass === undefined) {
+      return undefined;
+    }
+
+    const value = await computePublicBytecodeCommitment(contractClass.packedBytecode);
+    this.bytecodeCommitmentCache.set(key, value);
+    return value;
   }
 
   public async getDebugFunctionName(address: AztecAddress, selector: FunctionSelector): Promise<string | undefined> {
-    const artifact = await this.dataSource.getContractArtifact(address);
-    if (!artifact) {
-      return Promise.resolve(undefined);
-    }
-
-    const f = artifact.functions.find(f =>
-      FunctionSelector.fromNameAndParameters(f.name, f.parameters).equals(selector),
-    );
-    if (!f) {
-      return Promise.resolve(undefined);
-    }
-
-    return Promise.resolve(`${artifact.name}:${f.name}`);
+    return await this.dataSource.getContractFunctionName(address, selector);
   }
 }
 
 /**
  * A public state DB that reads and writes to the world state.
  */
-export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicStateDB, CommitmentsDB {
-  private logger = createDebugLogger('aztec:sequencer:world-state-db');
+export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicStateDB, MerkleTreeCheckpointOperations {
+  private logger = createLogger('simulator:world-state-db');
 
-  private publicCommittedWriteCache: Map<bigint, Fr> = new Map();
-  private publicCheckpointedWriteCache: Map<bigint, Fr> = new Map();
-  private publicUncommittedWriteCache: Map<bigint, Fr> = new Map();
-
-  constructor(private db: MerkleTreeWriteOperations, dataSource: ContractDataSource) {
+  constructor(public db: MerkleTreeWriteOperations, dataSource: ContractDataSource) {
     super(dataSource);
+  }
+
+  /**
+   * Checkpoints the current fork state
+   */
+  public async createCheckpoint() {
+    await this.db.createCheckpoint();
+  }
+
+  /**
+   * Commits the current checkpoint
+   */
+  public async commitCheckpoint() {
+    await this.db.commitCheckpoint();
+  }
+
+  /**
+   * Reverts the current checkpoint
+   */
+  public async revertCheckpoint() {
+    await this.db.revertCheckpoint();
+  }
+
+  public getMerkleInterface(): MerkleTreeWriteOperations {
+    return this.db;
   }
 
   /**
@@ -138,20 +175,6 @@ export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicS
    * @returns The current value in the storage slot.
    */
   public async storageRead(contract: AztecAddress, slot: Fr): Promise<Fr> {
-    const leafSlot = computePublicDataTreeLeafSlot(contract, slot).value;
-    const uncommitted = this.publicUncommittedWriteCache.get(leafSlot);
-    if (uncommitted !== undefined) {
-      return uncommitted;
-    }
-    const checkpointed = this.publicCheckpointedWriteCache.get(leafSlot);
-    if (checkpointed !== undefined) {
-      return checkpointed;
-    }
-    const committed = this.publicCommittedWriteCache.get(leafSlot);
-    if (committed !== undefined) {
-      return committed;
-    }
-
     return await readPublicState(this.db, contract, slot);
   }
 
@@ -162,78 +185,10 @@ export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicS
    * @param newValue - The new value to store.
    * @returns The slot of the written leaf in the public data tree.
    */
-  public storageWrite(contract: AztecAddress, slot: Fr, newValue: Fr): Promise<bigint> {
-    const index = computePublicDataTreeLeafSlot(contract, slot).value;
-    this.publicUncommittedWriteCache.set(index, newValue);
-    return Promise.resolve(index);
-  }
-
-  public async getNullifierMembershipWitnessAtLatestBlock(
-    nullifier: Fr,
-  ): Promise<NullifierMembershipWitness | undefined> {
-    const timer = new Timer();
-    const index = await this.db.findLeafIndex(MerkleTreeId.NULLIFIER_TREE, nullifier.toBuffer());
-    if (!index) {
-      return undefined;
-    }
-
-    const leafPreimagePromise = this.db.getLeafPreimage(MerkleTreeId.NULLIFIER_TREE, index);
-    const siblingPathPromise = this.db.getSiblingPath<typeof NULLIFIER_TREE_HEIGHT>(
-      MerkleTreeId.NULLIFIER_TREE,
-      BigInt(index),
-    );
-
-    const [leafPreimage, siblingPath] = await Promise.all([leafPreimagePromise, siblingPathPromise]);
-
-    if (!leafPreimage) {
-      return undefined;
-    }
-
-    this.logger.debug(`[DB] Fetched nullifier membership`, {
-      eventName: 'public-db-access',
-      duration: timer.ms(),
-      operation: 'get-nullifier-membership-witness-at-latest-block',
-    } satisfies PublicDBAccessStats);
-
-    return new NullifierMembershipWitness(BigInt(index), leafPreimage as NullifierLeafPreimage, siblingPath);
-  }
-
-  public async getL1ToL2MembershipWitness(
-    contractAddress: AztecAddress,
-    messageHash: Fr,
-    secret: Fr,
-  ): Promise<MessageLoadOracleInputs<typeof L1_TO_L2_MSG_TREE_HEIGHT>> {
-    let nullifierIndex: bigint | undefined;
-    let messageIndex: bigint | undefined;
-    let startIndex = 0n;
-
-    // We iterate over messages until we find one whose nullifier is not in the nullifier tree --> we need to check
-    // for nullifiers because messages can have duplicates.
-    const timer = new Timer();
-    do {
-      messageIndex = (await this.db.findLeafIndexAfter(MerkleTreeId.L1_TO_L2_MESSAGE_TREE, messageHash, startIndex))!;
-      if (messageIndex === undefined) {
-        throw new Error(`No non-nullified L1 to L2 message found for message hash ${messageHash.toString()}`);
-      }
-
-      const messageNullifier = computeL1ToL2MessageNullifier(contractAddress, messageHash, secret, messageIndex);
-      nullifierIndex = await this.getNullifierIndex(messageNullifier);
-
-      startIndex = messageIndex + 1n;
-    } while (nullifierIndex !== undefined);
-
-    const siblingPath = await this.db.getSiblingPath<typeof L1_TO_L2_MSG_TREE_HEIGHT>(
-      MerkleTreeId.L1_TO_L2_MESSAGE_TREE,
-      messageIndex,
-    );
-
-    this.logger.debug(`[DB] Fetched L1 to L2 message membership`, {
-      eventName: 'public-db-access',
-      duration: timer.ms(),
-      operation: 'get-l1-to-l2-message-membership-witness',
-    } satisfies PublicDBAccessStats);
-
-    return new MessageLoadOracleInputs<typeof L1_TO_L2_MSG_TREE_HEIGHT>(messageIndex, siblingPath);
+  public async storageWrite(contract: AztecAddress, slot: Fr, newValue: Fr): Promise<void> {
+    const leafSlot = await computePublicDataTreeLeafSlot(contract, slot);
+    const publicDataWrite = new PublicDataWrite(leafSlot, newValue);
+    await this.db.sequentialInsert(MerkleTreeId.PUBLIC_DATA_TREE, [publicDataWrite.toBuffer()]);
   }
 
   public async getL1ToL2LeafValue(leafIndex: bigint): Promise<Fr | undefined> {
@@ -245,17 +200,6 @@ export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicS
       operation: 'get-l1-to-l2-message-leaf-value',
     } satisfies PublicDBAccessStats);
     return leafValue;
-  }
-
-  public async getCommitmentIndex(commitment: Fr): Promise<bigint | undefined> {
-    const timer = new Timer();
-    const index = await this.db.findLeafIndex(MerkleTreeId.NOTE_HASH_TREE, commitment);
-    this.logger.debug(`[DB] Fetched commitment index`, {
-      eventName: 'public-db-access',
-      duration: timer.ms(),
-      operation: 'get-commitment-index',
-    } satisfies PublicDBAccessStats);
-    return index;
   }
 
   public async getCommitmentValue(leafIndex: bigint): Promise<Fr | undefined> {
@@ -271,7 +215,7 @@ export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicS
 
   public async getNullifierIndex(nullifier: Fr): Promise<bigint | undefined> {
     const timer = new Timer();
-    const index = await this.db.findLeafIndex(MerkleTreeId.NULLIFIER_TREE, nullifier.toBuffer());
+    const index = (await this.db.findLeafIndices(MerkleTreeId.NULLIFIER_TREE, [nullifier.toBuffer()]))[0];
     this.logger.debug(`[DB] Fetched nullifier index`, {
       eventName: 'public-db-access',
       duration: timer.ms(),
@@ -279,48 +223,10 @@ export class WorldStateDB extends ContractsDataSourcePublicDB implements PublicS
     } satisfies PublicDBAccessStats);
     return index;
   }
-
-  /**
-   * Commit the pending public changes to the DB.
-   * @returns Nothing.
-   */
-  commit(): Promise<void> {
-    for (const [k, v] of this.publicCheckpointedWriteCache) {
-      this.publicCommittedWriteCache.set(k, v);
-    }
-    // uncommitted writes take precedence over checkpointed writes
-    // since they are the most recent
-    for (const [k, v] of this.publicUncommittedWriteCache) {
-      this.publicCommittedWriteCache.set(k, v);
-    }
-    return this.rollbackToCommit();
-  }
-
-  /**
-   * Rollback the pending public changes.
-   * @returns Nothing.
-   */
-  async rollbackToCommit(): Promise<void> {
-    await this.rollbackToCheckpoint();
-    this.publicCheckpointedWriteCache = new Map<bigint, Fr>();
-    return Promise.resolve();
-  }
-
-  checkpoint(): Promise<void> {
-    for (const [k, v] of this.publicUncommittedWriteCache) {
-      this.publicCheckpointedWriteCache.set(k, v);
-    }
-    return this.rollbackToCheckpoint();
-  }
-
-  rollbackToCheckpoint(): Promise<void> {
-    this.publicUncommittedWriteCache = new Map<bigint, Fr>();
-    return Promise.resolve();
-  }
 }
 
 export async function readPublicState(db: MerkleTreeReadOperations, contract: AztecAddress, slot: Fr): Promise<Fr> {
-  const leafSlot = computePublicDataTreeLeafSlot(contract, slot).toBigInt();
+  const leafSlot = (await computePublicDataTreeLeafSlot(contract, slot)).toBigInt();
 
   const lowLeafResult = await db.getPreviousValueIndex(MerkleTreeId.PUBLIC_DATA_TREE, leafSlot);
   if (!lowLeafResult || !lowLeafResult.alreadyPresent) {

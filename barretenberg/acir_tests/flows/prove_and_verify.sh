@@ -1,8 +1,25 @@
-#!/bin/sh
+#!/bin/bash
+# prove_and_verify produces no output, so is parallel safe.
 set -eu
 
-VFLAG=${VERBOSE:+-v}
+flags="-c $CRS_PATH ${VERBOSE:+-v}"
+[ "${RECURSIVE}" = "true" ] && flags+=" --recursive"
 
-# This is the fastest flow, because it only generates pk/vk once, gate count once, etc.
-# It may not catch all class of bugs.
-$BIN prove_and_verify $VFLAG -c $CRS_PATH -b ./target/program.json
+case ${SYS:-} in
+  "")
+    cmd=prove_and_verify
+    ;;
+  "client_ivc")
+    cmd=prove_and_verify
+    flags+=" --scheme client_ivc ${INPUT_TYPE:---input_type compiletime_stack}"
+    ;;
+  "ultra_honk")
+    cmd=prove_and_verify
+    flags+=" --scheme ultra_honk ${INPUT_TYPE:---input_type compiletime_stack}"
+    ;;
+  *)
+    cmd=prove_and_verify_$SYS
+    ;;
+esac
+
+$BIN $cmd $flags -b ./target/program.json

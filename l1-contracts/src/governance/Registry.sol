@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2023 Aztec Labs.
+// Copyright 2024 Aztec Labs.
 pragma solidity >=0.8.27;
 
 import {IRegistry} from "@aztec/governance/interfaces/IRegistry.sol";
@@ -82,6 +82,14 @@ contract Registry is IRegistry, Ownable {
     returns (DataStructures.RegistrySnapshot memory)
   {
     return currentSnapshot;
+  }
+
+  /**
+   * @notice Returns the address of the governance
+   * @return The governance address
+   */
+  function getGovernance() external view override(IRegistry) returns (address) {
+    return owner();
   }
 
   /**

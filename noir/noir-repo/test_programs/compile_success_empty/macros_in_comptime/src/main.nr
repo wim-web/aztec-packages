@@ -5,11 +5,8 @@ use std::meta::unquote;
 global three_field: Field = 3;
 
 fn main() {
-    comptime
-    {
-        unsafe {
-            foo::<three_field>(5)
-        };
+    comptime {
+        foo::<three_field>(5);
         submodule::bar();
     }
 }
@@ -36,8 +33,8 @@ comptime fn foo<let N: Field>(x: Field) {
         break;
     }
 
-    let loop = quote { for _ in 0..0 { break; } };
-    unquote!(loop);
+    let loop_ = quote { for _ in 0..0 { break; } };
+    unquote!(loop_);
 }
 
 mod submodule {

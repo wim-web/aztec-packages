@@ -58,7 +58,7 @@ locals {
   node_p2p_private_keys  = var.NODE_P2P_PRIVATE_KEYS
   node_count             = length(local.sequencer_private_keys)
   data_dir               = "/usr/src/yarn-project/aztec"
-  eth_host               = var.ETHEREUM_HOST != "" ? var.ETHEREUM_HOST : "https://${var.DEPLOY_TAG}-mainnet-fork.aztec.network:8545/admin-${var.FORK_ADMIN_API_KEY}"
+  eth_host               = var.ETHEREUM_HOSTS != "" ? var.ETHEREUM_HOSTS : "https://${var.DEPLOY_TAG}-mainnet-fork.aztec.network:8545/admin-${var.FORK_ADMIN_API_KEY}"
 }
 
 output "node_count" {
@@ -253,11 +253,7 @@ resource "aws_ecs_task_definition" "aztec-node" {
           value = "80"
         },
         {
-          name  = "DEBUG"
-          value = "aztec:*,-json-rpc:json_proxy:*,-aztec:avm_simulator:*"
-        },
-        {
-          name  = "ETHEREUM_HOST"
+          name  = "ETHEREUM_HOSTS"
           value = "${local.eth_host}"
         },
         {
@@ -325,6 +321,10 @@ resource "aws_ecs_task_definition" "aztec-node" {
           value = data.terraform_remote_state.l1_contracts.outputs.fee_juice_contract_address
         },
         {
+          name  = "STAKING_ASSET_CONTRACT_ADDRESS"
+          value = data.terraform_remote_state.l1_contracts.outputs.staking_asset_contract_address
+        },
+        {
           name  = "FEE_JUICE_PORTAL_CONTRACT_ADDRESS"
           value = data.terraform_remote_state.l1_contracts.outputs.FEE_JUICE_PORTAL_CONTRACT_ADDRESS
         },
@@ -367,10 +367,6 @@ resource "aws_ecs_task_definition" "aztec-node" {
         {
           name  = "PEER_ID_PRIVATE_KEY"
           value = local.node_p2p_private_keys[count.index]
-        },
-        {
-          name  = "P2P_MIN_PEERS"
-          value = var.P2P_MIN_PEERS
         },
         {
           name  = "P2P_MAX_PEERS"

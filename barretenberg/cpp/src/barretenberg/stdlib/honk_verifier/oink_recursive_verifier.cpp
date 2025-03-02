@@ -2,7 +2,10 @@
 
 #include "barretenberg/numeric/bitop/get_msb.hpp"
 #include "barretenberg/plonk_honk_shared/library/grand_product_delta.hpp"
-#include "barretenberg/transcript/transcript.hpp"
+#include "barretenberg/stdlib_circuit_builders/mega_recursive_flavor.hpp"
+#include "barretenberg/stdlib_circuit_builders/mega_zk_recursive_flavor.hpp"
+#include "barretenberg/stdlib_circuit_builders/ultra_recursive_flavor.hpp"
+#include "barretenberg/stdlib_circuit_builders/ultra_rollup_recursive_flavor.hpp"
 #include <utility>
 
 namespace bb::stdlib::recursion::honk {
@@ -48,7 +51,11 @@ template <typename Flavor> void OinkRecursiveVerifier_<Flavor>::verify()
         throw_or_abort("OinkRecursiveVerifier::verify: proof circuit size does not match verification key");
     }
     if (static_cast<uint32_t>(public_input_size.get_value()) != verification_key->verification_key->num_public_inputs) {
-        throw_or_abort("OinkRecursiveVerifier::verify: proof public input size does not match verification key");
+        const std::string message = "OinkRecursiveVerifier::verify: proof public input size (" +
+                                    std::to_string(static_cast<uint32_t>(public_input_size.get_value())) +
+                                    ") does not match verification key public input size (" +
+                                    std::to_string(verification_key->verification_key->num_public_inputs) + ")";
+        throw_or_abort(message);
     }
     if (static_cast<uint32_t>(pub_inputs_offset.get_value()) != verification_key->verification_key->pub_inputs_offset) {
         throw_or_abort("OinkRecursiveVerifier::verify: proof public input offset does not match verification key");
@@ -66,7 +73,7 @@ template <typename Flavor> void OinkRecursiveVerifier_<Flavor>::verify()
     commitments.w_o = transcript->template receive_from_prover<Commitment>(domain_separator + labels.w_o);
 
     // If Goblin, get commitments to ECC op wire polynomials and DataBus columns
-    if constexpr (IsGoblinFlavor<Flavor>) {
+    if constexpr (IsMegaFlavor<Flavor>) {
         // Receive ECC op wire commitments
         for (auto [commitment, label] : zip_view(commitments.get_ecc_op_wires(), labels.get_ecc_op_wires())) {
             commitment = transcript->template receive_from_prover<Commitment>(domain_separator + label);
@@ -96,7 +103,7 @@ template <typename Flavor> void OinkRecursiveVerifier_<Flavor>::verify()
         transcript->template receive_from_prover<Commitment>(domain_separator + labels.lookup_inverses);
 
     // If Goblin (i.e. using DataBus) receive commitments to log-deriv inverses polynomials
-    if constexpr (IsGoblinFlavor<Flavor>) {
+    if constexpr (IsMegaFlavor<Flavor>) {
         for (auto [commitment, label] : zip_view(commitments.get_databus_inverses(), labels.get_databus_inverses())) {
             commitment = transcript->template receive_from_prover<Commitment>(domain_separator + label);
         }
@@ -130,6 +137,9 @@ template class OinkRecursiveVerifier_<bb::UltraRecursiveFlavor_<UltraCircuitBuil
 template class OinkRecursiveVerifier_<bb::UltraRecursiveFlavor_<MegaCircuitBuilder>>;
 template class OinkRecursiveVerifier_<bb::MegaRecursiveFlavor_<UltraCircuitBuilder>>;
 template class OinkRecursiveVerifier_<bb::MegaRecursiveFlavor_<MegaCircuitBuilder>>;
+template class OinkRecursiveVerifier_<bb::MegaZKRecursiveFlavor_<MegaCircuitBuilder>>;
+template class OinkRecursiveVerifier_<bb::MegaZKRecursiveFlavor_<UltraCircuitBuilder>>;
 template class OinkRecursiveVerifier_<bb::UltraRecursiveFlavor_<CircuitSimulatorBN254>>;
 template class OinkRecursiveVerifier_<bb::MegaRecursiveFlavor_<CircuitSimulatorBN254>>;
+template class OinkRecursiveVerifier_<bb::UltraRollupRecursiveFlavor_<UltraCircuitBuilder>>;
 } // namespace bb::stdlib::recursion::honk

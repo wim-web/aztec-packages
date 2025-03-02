@@ -1,7 +1,8 @@
-mod collapse_array;
-mod comparison;
-mod point;
-mod test;
-mod to_bytes;
-
-pub use crate::utils::collapse_array::collapse_array;
+pub mod bytes;
+pub mod array;
+pub mod comparison;
+pub mod field;
+pub mod point;
+pub mod to_bytes;
+pub mod secrets;
+pub mod with_hash;

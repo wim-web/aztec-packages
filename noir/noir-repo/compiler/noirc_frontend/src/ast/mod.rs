@@ -5,6 +5,7 @@
 //! Noir's Ast is produced by the parser and taken as input to name resolution,
 //! where it is converted into the Hir (defined in the hir_def module).
 mod docs;
+mod enumeration;
 mod expression;
 mod function;
 mod statement;
@@ -13,13 +14,19 @@ mod traits;
 mod type_alias;
 mod visitor;
 
+use noirc_errors::Location;
 pub use visitor::AttributeTarget;
 pub use visitor::Visitor;
 
 pub use expression::*;
 pub use function::*;
 
+#[cfg(test)]
+use proptest_derive::Arbitrary;
+
+use acvm::FieldElement;
 pub use docs::*;
+pub use enumeration::*;
 use noirc_errors::Span;
 use serde::{Deserialize, Serialize};
 pub use statement::*;
@@ -36,6 +43,7 @@ use crate::{
 use acvm::acir::AcirField;
 use iter_extended::vecmap;
 
+#[cfg_attr(test, derive(Arbitrary))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Ord, PartialOrd)]
 pub enum IntegerBitSize {
     One,
@@ -43,6 +51,7 @@ pub enum IntegerBitSize {
     Sixteen,
     ThirtyTwo,
     SixtyFour,
+    HundredTwentyEight,
 }
 
 impl IntegerBitSize {
@@ -53,6 +62,7 @@ impl IntegerBitSize {
             IntegerBitSize::Sixteen => 16,
             IntegerBitSize::ThirtyTwo => 32,
             IntegerBitSize::SixtyFour => 64,
+            IntegerBitSize::HundredTwentyEight => 128,
         }
     }
 }
@@ -72,6 +82,7 @@ impl From<IntegerBitSize> for u32 {
             Sixteen => 16,
             ThirtyTwo => 32,
             SixtyFour => 64,
+            HundredTwentyEight => 128,
         }
     }
 }
@@ -89,6 +100,7 @@ impl TryFrom<u32> for IntegerBitSize {
             16 => Ok(Sixteen),
             32 => Ok(ThirtyTwo),
             64 => Ok(SixtyFour),
+            128 => Ok(HundredTwentyEight),
             _ => Err(InvalidIntegerBitSizeError(value)),
         }
     }
@@ -158,7 +170,7 @@ pub enum UnresolvedTypeData {
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct UnresolvedType {
     pub typ: UnresolvedTypeData,
-    pub span: Span,
+    pub location: Location,
 }
 
 /// An argument to a generic type or trait.
@@ -172,6 +184,12 @@ pub enum GenericTypeArg {
     Named(Ident, UnresolvedType),
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum GenericTypeArgKind {
+    Ordered,
+    Named,
+}
+
 #[derive(Debug, Default, PartialEq, Eq, Clone, Hash)]
 pub struct GenericTypeArgs {
     /// Each ordered argument, e.g. `<A, B, C>`
@@ -180,11 +198,22 @@ pub struct GenericTypeArgs {
     /// All named arguments, e.g. `<A = B, C = D, E = F>`.
     /// Used for associated types.
     pub named_args: Vec<(Ident, UnresolvedType)>,
+
+    /// The kind of each argument, in order (in case traversing the generics in order is needed)
+    pub kinds: Vec<GenericTypeArgKind>,
 }
 
 impl GenericTypeArgs {
     pub fn is_empty(&self) -> bool {
         self.ordered_args.is_empty() && self.named_args.is_empty()
+    }
+
+    fn contains_unspecified(&self) -> bool {
+        let ordered_args_contains_unspecified =
+            self.ordered_args.iter().any(|ordered_arg| ordered_arg.contains_unspecified());
+        let named_args_contains_unspecified =
+            self.named_args.iter().any(|(_name, named_arg)| named_arg.contains_unspecified());
+        ordered_args_contains_unspecified || named_args_contains_unspecified
     }
 }
 
@@ -201,38 +230,20 @@ impl From<Vec<GenericTypeArg>> for GenericTypeArgs {
     }
 }
 
-/// Type wrapper for a member access
-pub struct UnaryRhsMemberAccess {
-    pub method_or_field: Ident,
-    pub method_call: Option<UnaryRhsMethodCall>,
-}
-
-pub struct UnaryRhsMethodCall {
-    pub turbofish: Option<Vec<UnresolvedType>>,
-    pub macro_call: bool,
-    pub args: Vec<Expression>,
-}
-
 /// The precursor to TypeExpression, this is the type that the parser allows
 /// to be used in the length position of an array type. Only constant integers, variables,
 /// and numeric binary operators are allowed here.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum UnresolvedTypeExpression {
     Variable(Path),
-    Constant(u32, Span),
+    Constant(FieldElement, Location),
     BinaryOperation(
         Box<UnresolvedTypeExpression>,
         BinaryTypeOperator,
         Box<UnresolvedTypeExpression>,
-        Span,
+        Location,
     ),
     AsTraitPath(Box<AsTraitPath>),
-}
-
-impl Recoverable for UnresolvedType {
-    fn error(span: Span) -> Self {
-        UnresolvedType { typ: UnresolvedTypeData::Error, span }
-    }
 }
 
 impl std::fmt::Display for GenericTypeArg {
@@ -346,16 +357,24 @@ impl UnresolvedType {
     }
 
     pub fn from_path(mut path: Path) -> Self {
-        let span = path.span;
+        let location = path.location;
         let last_segment = path.segments.last_mut().unwrap();
         let generics = last_segment.generics.take();
         let generic_type_args = if let Some(generics) = generics {
-            GenericTypeArgs { ordered_args: generics, named_args: Vec::new() }
+            let mut kinds = Vec::with_capacity(generics.len());
+            for _ in 0..generics.len() {
+                kinds.push(GenericTypeArgKind::Ordered);
+            }
+            GenericTypeArgs { ordered_args: generics, named_args: Vec::new(), kinds }
         } else {
             GenericTypeArgs::default()
         };
         let typ = UnresolvedTypeData::Named(path, generic_type_args, true);
-        UnresolvedType { typ, span }
+        UnresolvedType { typ, location }
+    }
+
+    pub(crate) fn contains_unspecified(&self) -> bool {
+        self.typ.contains_unspecified()
     }
 }
 
@@ -366,7 +385,11 @@ impl UnresolvedTypeData {
         use {IntType::*, UnresolvedTypeData::Integer};
         match token {
             Signed(num_bits) => {
-                Ok(Integer(Signedness::Signed, IntegerBitSize::try_from(num_bits)?))
+                if num_bits == 128 {
+                    Err(InvalidIntegerBitSizeError(128))
+                } else {
+                    Ok(Integer(Signedness::Signed, IntegerBitSize::try_from(num_bits)?))
+                }
             }
             Unsigned(num_bits) => {
                 Ok(Integer(Signedness::Unsigned, IntegerBitSize::try_from(num_bits)?))
@@ -374,8 +397,53 @@ impl UnresolvedTypeData {
         }
     }
 
-    pub fn with_span(&self, span: Span) -> UnresolvedType {
-        UnresolvedType { typ: self.clone(), span }
+    pub fn with_location(&self, location: Location) -> UnresolvedType {
+        UnresolvedType { typ: self.clone(), location }
+    }
+
+    pub fn with_dummy_location(&self) -> UnresolvedType {
+        self.with_location(Location::dummy())
+    }
+
+    fn contains_unspecified(&self) -> bool {
+        match self {
+            UnresolvedTypeData::Array(typ, length) => {
+                typ.contains_unspecified() || length.contains_unspecified()
+            }
+            UnresolvedTypeData::Slice(typ) => typ.contains_unspecified(),
+            UnresolvedTypeData::Expression(expr) => expr.contains_unspecified(),
+            UnresolvedTypeData::String(length) => length.contains_unspecified(),
+            UnresolvedTypeData::FormatString(typ, length) => {
+                typ.contains_unspecified() || length.contains_unspecified()
+            }
+            UnresolvedTypeData::Parenthesized(typ) => typ.contains_unspecified(),
+            UnresolvedTypeData::Named(path, args, _is_synthesized) => {
+                // '_' is unspecified
+                let path_is_wildcard = path.is_wildcard();
+                let an_arg_is_unresolved = args.contains_unspecified();
+                path_is_wildcard || an_arg_is_unresolved
+            }
+            UnresolvedTypeData::TraitAsType(_path, args) => args.contains_unspecified(),
+            UnresolvedTypeData::MutableReference(typ) => typ.contains_unspecified(),
+            UnresolvedTypeData::Tuple(args) => args.iter().any(|arg| arg.contains_unspecified()),
+            UnresolvedTypeData::Function(args, ret, env, _unconstrained) => {
+                let args_contains_unspecified = args.iter().any(|arg| arg.contains_unspecified());
+                args_contains_unspecified
+                    || ret.contains_unspecified()
+                    || env.contains_unspecified()
+            }
+            UnresolvedTypeData::Unspecified => true,
+
+            UnresolvedTypeData::FieldElement
+            | UnresolvedTypeData::Integer(_, _)
+            | UnresolvedTypeData::Bool
+            | UnresolvedTypeData::Unit
+            | UnresolvedTypeData::Quoted(_)
+            | UnresolvedTypeData::AsTraitPath(_)
+            | UnresolvedTypeData::Resolved(_)
+            | UnresolvedTypeData::Interned(_)
+            | UnresolvedTypeData::Error => false,
+        }
     }
 }
 
@@ -400,36 +468,43 @@ impl UnresolvedTypeExpression {
     #[allow(clippy::result_large_err)]
     pub(crate) fn from_expr(
         expr: Expression,
-        span: Span,
+        location: Location,
     ) -> Result<UnresolvedTypeExpression, ParserError> {
         Self::from_expr_helper(expr).map_err(|err_expr| {
-            ParserError::with_reason(ParserErrorReason::InvalidTypeExpression(err_expr), span)
+            ParserError::with_reason(ParserErrorReason::InvalidTypeExpression(err_expr), location)
         })
     }
 
-    pub fn span(&self) -> Span {
+    pub fn location(&self) -> Location {
         match self {
-            UnresolvedTypeExpression::Variable(path) => path.span(),
-            UnresolvedTypeExpression::Constant(_, span) => *span,
-            UnresolvedTypeExpression::BinaryOperation(_, _, _, span) => *span,
+            UnresolvedTypeExpression::Variable(path) => path.location,
+            UnresolvedTypeExpression::Constant(_, location) => *location,
+            UnresolvedTypeExpression::BinaryOperation(_, _, _, location) => *location,
             UnresolvedTypeExpression::AsTraitPath(path) => {
-                path.trait_path.span.merge(path.impl_item.span())
+                path.trait_path.location.merge(path.impl_item.location())
             }
         }
     }
 
+    pub fn span(&self) -> Span {
+        self.location().span
+    }
+
     fn from_expr_helper(expr: Expression) -> Result<UnresolvedTypeExpression, Expression> {
         match expr.kind {
-            ExpressionKind::Literal(Literal::Integer(int, _)) => match int.try_to_u32() {
-                Some(int) => Ok(UnresolvedTypeExpression::Constant(int, expr.span)),
+            ExpressionKind::Literal(Literal::Integer(int)) => match int.try_to_unsigned::<u32>() {
+                Some(int) => Ok(UnresolvedTypeExpression::Constant(int.into(), expr.location)),
                 None => Err(expr),
             },
             ExpressionKind::Variable(path) => Ok(UnresolvedTypeExpression::Variable(path)),
             ExpressionKind::Prefix(prefix) if prefix.operator == UnaryOp::Minus => {
-                let lhs = Box::new(UnresolvedTypeExpression::Constant(0, expr.span));
+                let lhs = Box::new(UnresolvedTypeExpression::Constant(
+                    FieldElement::zero(),
+                    expr.location,
+                ));
                 let rhs = Box::new(UnresolvedTypeExpression::from_expr_helper(prefix.rhs)?);
                 let op = BinaryTypeOperator::Subtraction;
-                Ok(UnresolvedTypeExpression::BinaryOperation(lhs, op, rhs, expr.span))
+                Ok(UnresolvedTypeExpression::BinaryOperation(lhs, op, rhs, expr.location))
             }
             ExpressionKind::Infix(infix) if Self::operator_allowed(infix.operator.contents) => {
                 let lhs = Box::new(UnresolvedTypeExpression::from_expr_helper(infix.lhs)?);
@@ -455,7 +530,7 @@ impl UnresolvedTypeExpression {
                         unreachable!("impossible via `operator_allowed` check")
                     }
                 };
-                Ok(UnresolvedTypeExpression::BinaryOperation(lhs, op, rhs, expr.span))
+                Ok(UnresolvedTypeExpression::BinaryOperation(lhs, op, rhs, expr.location))
             }
             ExpressionKind::AsTraitPath(path) => {
                 Ok(UnresolvedTypeExpression::AsTraitPath(Box::new(path)))
@@ -474,6 +549,19 @@ impl UnresolvedTypeExpression {
                 | BinaryOpKind::Divide
                 | BinaryOpKind::Modulo
         )
+    }
+
+    fn contains_unspecified(&self) -> bool {
+        match self {
+            // '_' is unspecified
+            UnresolvedTypeExpression::Variable(path) => path.is_wildcard(),
+            UnresolvedTypeExpression::BinaryOperation(lhs, _op, rhs, _span) => {
+                lhs.contains_unspecified() || rhs.contains_unspecified()
+            }
+            UnresolvedTypeExpression::Constant(_, _) | UnresolvedTypeExpression::AsTraitPath(_) => {
+                false
+            }
+        }
     }
 }
 
@@ -495,12 +583,13 @@ impl std::fmt::Display for ItemVisibility {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 /// Represents whether the parameter is public or known only to the prover.
 pub enum Visibility {
     Public,
     // Constants are not allowed in the ABI for main at the moment.
     // Constant,
+    #[default]
     Private,
     /// DataBus is public input handled as private input. We use the fact that return values are properly computed by the program to avoid having them as public inputs
     /// it is useful for recursion and is handled by the proving system.

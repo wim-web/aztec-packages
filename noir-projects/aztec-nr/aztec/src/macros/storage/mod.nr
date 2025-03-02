@@ -1,9 +1,12 @@
-use std::{collections::umap::UHashMap, hash::{BuildHasherDefault, poseidon2::Poseidon2Hasher}, meta::unquote};
+use std::{collections::umap::UHashMap, hash::{BuildHasherDefault, poseidon2::Poseidon2Hasher}};
 
-use super::utils::get_serialized_size;
+use super::utils::get_storage_size;
 use super::utils::is_note;
 
-comptime mut global STORAGE_LAYOUT_NAME: UHashMap<Module, Quoted, BuildHasherDefault<Poseidon2Hasher>> = UHashMap::default();
+/// Stores a map from a module to the name of the struct that describes its storage layout.
+/// This is then used when generating a `storage_layout()` getter on the contract struct.
+pub comptime mut global STORAGE_LAYOUT_NAME: UHashMap<Module, Quoted, BuildHasherDefault<Poseidon2Hasher>> =
+    UHashMap::default();
 
 /// Marks a struct as the one describing the storage layout of a contract. Only a single struct in the entire contract
 /// should have this macro (or `storage_no_init`) applied to it.
@@ -16,33 +19,36 @@ pub comptime fn storage(s: StructDefinition) -> Quoted {
     //  - it implements said `init` function by allocating appropriate storage slots to each state variable.
     //  - it exposes the storage layout by creating a `StorageLayout` struct that is exposed via the `abi(storage)`
     //    macro.
-
     let mut slot: u32 = 1;
     let mut storage_vars_constructors = &[];
     let mut storage_layout_fields = &[];
     let mut storage_layout_constructors = &[];
 
     // TODO(#8658): uncomment the code below to inject the Context type parameter.
-
     //let mut new_storage_fields = &[];
     //let context_generic = s.add_generic("Context");
-    for field in s.fields() {
+    for field in s.fields_as_written() {
+        // FIXME: This doesn't handle field types with generics
         let (name, typ) = field;
-        let (storage_field_constructor, serialized_size) = generate_storage_field_constructor(typ, quote { $slot }, false);
-        storage_vars_constructors = storage_vars_constructors.push_back(quote { $name: $storage_field_constructor });
+        let (storage_field_constructor, storage_size) =
+            generate_storage_field_constructor(typ, quote { $slot }, false);
+        storage_vars_constructors =
+            storage_vars_constructors.push_back(quote { $name: $storage_field_constructor });
         // We have `Storable` in a separate `.nr` file instead of defining it in the last quote of this function
         // because that way a dev gets a more reasonable error if he defines a struct with the same name in
         // a contract.
-        storage_layout_fields = storage_layout_fields.push_back(quote { $name: dep::aztec::prelude::Storable });
-        storage_layout_constructors = storage_layout_constructors.push_back(quote { $name: dep::aztec::prelude::Storable { slot: $slot } });
+        storage_layout_fields =
+            storage_layout_fields.push_back(quote { pub $name: dep::aztec::prelude::Storable });
+        storage_layout_constructors = storage_layout_constructors.push_back(
+            quote { $name: dep::aztec::prelude::Storable { slot: $slot } },
+        );
         //let with_context_generic = add_context_generic(typ, context_generic);
         //println(with_context_generic);
         //new_storage_fields = new_storage_fields.push_back((name,  with_context_generic ));
-        slot += serialized_size;
+        slot += storage_size;
     }
 
     //s.set_fields(new_storage_fields);
-
     let storage_vars_constructors = storage_vars_constructors.join(quote {,});
     let storage_impl = quote {
         impl<Context> Storage<Context> {
@@ -60,23 +66,23 @@ pub comptime fn storage(s: StructDefinition) -> Quoted {
     let module = s.module();
     let module_name = module.name();
     let storage_layout_name = f"STORAGE_LAYOUT_{module_name}".quoted_contents();
-    let module_name_str = module_name.as_str_quote();
+    let (module_name_str, module_name_len) = module_name.as_str_quote();
     STORAGE_LAYOUT_NAME.insert(module, storage_layout_name);
 
     quote {
         $storage_impl
 
-        struct StorageLayoutFields {
+        pub struct StorageLayoutFields {
             $storage_layout_fields
         }
 
-        struct StorageLayout<let N: u32> {
-            contract_name: str<N>,
-            fields: StorageLayoutFields
+        pub struct StorageLayout<let N: u32> {
+            pub contract_name: str<N>,
+            pub fields: StorageLayoutFields
         }
 
         #[abi(storage)]
-        global $storage_layout_name = StorageLayout {
+        pub global $storage_layout_name: StorageLayout<$module_name_len> = StorageLayout {
             contract_name: $module_name_str,
             fields: StorageLayoutFields { $storage_layout_constructors }
         };
@@ -95,41 +101,43 @@ pub comptime fn storage_no_init(_s: StructDefinition) {
 
 /// Returns the expression required to initialize a state variable with a given slot, along with its serialization size,
 /// i.e. how many contiguous storage slots the variable requires.
-comptime fn generate_storage_field_constructor(typ: Type, slot: Quoted, parent_is_map: bool) -> (Quoted, u32) {
+comptime fn generate_storage_field_constructor(
+    typ: Type,
+    slot: Quoted,
+    parent_is_map: bool,
+) -> (Quoted, u32) {
     assert(
-        typ.as_struct().is_some(), "Storage containers must be generic structs of the form `Container<_, Context>`, or Map<Key, _, Context>"
+        typ.as_struct().is_some(),
+        "Storage containers must be generic structs of the form `Container<_, Context>`, or Map<Key, _, Context>",
     );
     let (container_struct, generics) = typ.as_struct().unwrap();
     let struct_name = container_struct.name();
 
     if is_storage_map(typ) {
         // Map state variables recursively initialize their contents - this includes nested maps.
-        let (value_constructor, _) = generate_storage_field_constructor(generics[1], quote { slot }, true);
+        let (value_constructor, _) =
+            generate_storage_field_constructor(generics[1], quote { slot }, true);
         (quote { $struct_name::new(context, $slot, | context, slot | { $value_constructor }) }, 1)
     } else {
-        let (container_struct, container_struct_generics) = typ.as_struct().unwrap();
-        let container_struct_name = container_struct.name();
-
-        let serialized_size = if parent_is_map {
+        let storage_size = if parent_is_map {
             // Variables inside a map do not require contiguous slots since the map slot derivation is assumed to result
             // in slots very far away from one another.
             1
         } else {
+            let (_, container_struct_generics) = typ.as_struct().unwrap();
             let stored_struct = container_struct_generics[0];
-            if is_note(stored_struct) & (container_struct_name != quote { PublicMutable }) {
+
+            if is_note(stored_struct) {
                 // Private notes always occupy a single slot, since the slot is only used as a state variable
                 // identifier.
-
-                // Someone could store a Note in PublicMutable for whatever reason though.
-                // TODO(#8659): remove the PublicMutable exception above
                 1
             } else {
-                get_serialized_size(stored_struct)
+                get_storage_size(typ)
             }
         };
 
         // We assume below that all state variables implement `fn new<Context>(context: Context, slot: Field) -> Self`.
-        (quote { $struct_name::new(context, $slot)}, serialized_size)
+        (quote { $struct_name::new(context, $slot)}, storage_size)
     }
 }
 
@@ -152,7 +160,9 @@ comptime fn is_storage_map(typ: Type) -> bool {
 }
 
 comptime fn add_context_generic(typ: Type, context_generic: Type) -> Type {
-    let (def, mut generics) = typ.as_struct().expect(f"Storage containers must be generic structs of the form `Container<..., Context>`");
+    let (def, mut generics) = typ.as_struct().expect(
+        f"Storage containers must be generic structs of the form `Container<..., Context>`",
+    );
     let name = def.name();
 
     if is_storage_map(typ) {
@@ -162,6 +172,6 @@ comptime fn add_context_generic(typ: Type, context_generic: Type) -> Type {
         generics[generics.len() - 1] = context_generic;
     }
 
-    let generics = generics.map(|typ: Type| quote{$typ}).join(quote{,});
+    let generics = generics.map(|typ: Type| quote {$typ}).join(quote {,});
     quote { $name<$generics> }.as_type()
 }

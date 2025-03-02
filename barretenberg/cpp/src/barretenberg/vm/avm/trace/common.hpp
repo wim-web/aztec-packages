@@ -11,7 +11,7 @@
 
 namespace bb::avm_trace {
 
-using FF = AvmFlavorSettings::FF;
+using FF = bb::avm::AvmFlavorSettings::FF;
 
 // There are 4 public input columns, 1 for context inputs, and 3 for emitting side effects
 template <typename FF_>
@@ -38,17 +38,16 @@ enum class IndirectRegister : uint32_t { IND_A = 0, IND_B = 1, IND_C = 2, IND_D 
 
 // Keep following enum in sync with MAX_MEM_TAG below
 enum class AvmMemoryTag : uint32_t {
-    U0 = 0,
+    FF = MEM_TAG_FF,
     U1 = MEM_TAG_U1,
     U8 = MEM_TAG_U8,
     U16 = MEM_TAG_U16,
     U32 = MEM_TAG_U32,
     U64 = MEM_TAG_U64,
     U128 = MEM_TAG_U128,
-    FF = MEM_TAG_FF,
 };
 
-static const uint32_t MAX_MEM_TAG = MEM_TAG_FF;
+static const uint32_t MAX_MEM_TAG = MEM_TAG_U128;
 
 static const size_t NUM_MEM_SPACES = 256;
 static const uint8_t INTERNAL_CALL_SPACE_ID = 255;

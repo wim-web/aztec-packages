@@ -5,9 +5,12 @@ trait Serialize {
     fn serialize(self) -> [Field; Self::Size];
 }
 
-impl<A, B, let AS: u32, let BS: u32> Serialize for (A, B) where A: Serialize<Size = AS>, B: Serialize<Size = BS> {
-    // let Size = <A as Serialize>::Size + <B as Serialize>::Size;
-    let Size: u32 = AS + BS;
+impl<A, B> Serialize for (A, B)
+where
+    A: Serialize,
+    B: Serialize,
+{
+    let Size = <A as Serialize>::Size + <B as Serialize>::Size;
 
     fn serialize(self: Self) -> [Field; Self::Size] {
         let mut array: [Field; Self::Size] = std::mem::zeroed();
@@ -24,9 +27,11 @@ impl<A, B, let AS: u32, let BS: u32> Serialize for (A, B) where A: Serialize<Siz
     }
 }
 
-impl<T, let N: u32, let TS: u32> Serialize for [T; N] where T: Serialize<Size = TS> {
-    // let Size = <T as Serialize>::Size * N;
-    let Size: u32 = TS * N;
+impl<T, let N: u32> Serialize for [T; N]
+where
+    T: Serialize,
+{
+    let Size = <T as Serialize>::Size * N;
 
     fn serialize(self: Self) -> [Field; Self::Size] {
         let mut array: [Field; Self::Size] = std::mem::zeroed();

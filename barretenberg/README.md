@@ -1,3 +1,9 @@
+> [!WARNING]
+> :warning: This is not an actively developed repository, it is a mirror. See <https://github.com/AztecProtocol/aztec-packages> :warning:
+
+> [!WARNING]
+> :warning: **<https://github.com/AztecProtocol/barretenberg> is a mirror-only repository, please only use <https://github.com/AztecProtocol/aztec-packages>. Do not use this for any purpose other than reference.** :warning:
+
 ![banner](../.github/img/bb_banner.png)
 
 # Barretenberg
@@ -24,22 +30,15 @@ Barretenberg (or `bb` for short) is an optimized elliptic curve library for the 
       - [Testing locally in docker](#testing-locally-in-docker)
   - [Docs Build](#docs-build)
   - [Benchmarks](#benchmarks)
-    - [x86\_64](#x86_64)
+    - [x86_64](#x86_64)
     - [WASM](#wasm)
     - [How to run](#how-to-run)
   - [Debugging](#debugging)
-    - [Debugging Verifification Failures](#debugging-verifification-failures)
+    - [Debugging Verification Failures](#debugging-verifification-failures)
     - [Improving LLDB Debugging](#improving-lldb-debugging)
     - [Using Tracy to Profile Memory/CPU](#using-tracy-to-profile-memorycpu)
 
-> [!WARNING]
-> :warning: This is not an actively developed repository, it is a mirror. See <https://github.com/AztecProtocol/aztec-packages> :warning:
-
-> [!WARNING]
-> :warning: **<https://github.com/AztecProtocol/barretenberg> is a mirror-only repository, please only use <https://github.com/AztecProtocol/aztec-packages>. Do not use this for any purpose other than reference.** :warning:
-
-> [!CAUTION]
-> **This code is highly experimental, use at your own risk!**
+> [!CAUTION] > **This code is highly experimental, use at your own risk!**
 
 ## Installation
 
@@ -66,14 +65,14 @@ All available `bb` commands:
 Prove the valid execution of your program:
 
 ```bash
-bb prove_ultra_honk -b ./target/hello_world.json -w ./target/witness-name.gz -o ./target/proof
+bb prove --scheme ultra_honk -b ./target/hello_world.json -w ./target/witness-name.gz -o ./target/proof
 ```
 
 You can then compute the verification key for your Noir program and verify the proof:
 
 ```bash
-bb write_vk_ultra_honk -b ./target/hello_world.json -o ./target/vk
-bb verify_ultra_honk -k ./target/vk -p ./target/proof
+bb write_vk --scheme ultra_honk -b ./target/hello_world.json -o ./target/vk
+bb verify --scheme ultra_honk -k ./target/vk -p ./target/proof
 
 ```
 
@@ -83,7 +82,7 @@ If successful, the verification will complete in silence.
 
 The usage with MegaHonk is similar to the above UltraHonk. Refer to all the available `bb` commands, using the `bb <command>_mega_honk` syntax.
 
->[!WARNING]
+> [!WARNING]
 > MegaHonk generates insecure recursion circuits when Goblin recursive verifiers are not present.
 
 ### Solidity verifier
@@ -93,21 +92,20 @@ Barretenberg can generate a smart contract that verifies proofs in Solidity (i.e
 First, prove the valid execution of your Noir program and export the verification key:
 
 ```bash
-bb prove_ultra_keccak_honk -b ./target/hello_world.json -w ./target/witness-name.gz -o ./target/proof
-bb write_vk_ultra_honk -b ./target/hello_world.json -o ./target/vk
+bb prove --sceme ultra_honk -b ./target/hello_world.json -w ./target/witness-name.gz -o ./target/proof
+bb write_vk --scheme ultra_honk -b ./target/hello_world.json -o ./target/vk
 ```
 
-> [!IMPORTANT]
-> `prove_ultra_keccak_honk` is used to generate UltraHonk proofs with Keccak hashes, making them gas-efficient. `prove_ultra_honk` in comparison generates proofs with Poseidon hashes, more efficient in recursions but not on-chain verifications.
+> [!IMPORTANT] > `prove --scheme ultra_honk --oracle_hash keccak` is used to generate UltraHonk proofs with Keccak hashes, making them gas-efficient. `prove --scheme ultra_honk` in comparison generates proofs with Poseidon hashes, more efficient in recursions but not on-chain verifications.
 
 You can now use the verification key to generate a Solidity verifier contract:
 
 ```bash
-bb contract_ultra_honk -k ./target/vk -c $CRS_PATH -b ./target/hello_world.json -o ./target/Verifier.sol
+bb write_solidity_verifier --scheme ultra_honk -k ./target/vk -c $CRS_PATH -b ./target/hello_world.json -o ./target/Verifier.sol
 ```
 
->[!CAUTION]
-> Solidity verifier contracts are work-in-progress. Expect significant optimizations and breaking changes, and *do NOT use it in production!*
+> [!CAUTION]
+> Solidity verifier contracts are work-in-progress. Expect significant optimizations and breaking changes, and _do NOT use it in production!_
 
 ## Development
 
@@ -132,6 +130,11 @@ When running MacOS Sonoma 14.2.1 the following steps are necessary:
 
 - update bash with `brew install bash`
 - update [cmake](https://cmake.org/download)
+
+It is recommended to use homebrew llvm on macOS to enable std::execution parallel algorithms. To do so:
+
+- Install llvm with `brew install llvm`
+- Add it to the path with `export PATH="/opt/homebrew/opt/llvm/bin:$PATH"` in your shell or profile file.
 
 <details>
 <summary><h3>Installing openMP (Linux)</h3></summary>
@@ -186,9 +189,7 @@ CMake can be passed various build options on its command line:
 - `-DBENCHMARK=ON | OFF`: Enable/disable building of benchmarks.
 - `-DFUZZING=ON | OFF`: Enable building various fuzzers.
 
-If you are cross-compiling, you can use a preconfigured toolchain file:
-
-- `-DCMAKE_TOOLCHAIN_FILE=<filename in ./cmake/toolchains>`: Use one of the preconfigured toolchains.
+Various presets are defined in CMakePresets.json for scenarios such as instrumentation, cross-compiling and targets such as WASM.
 
 #### WASM build
 
@@ -267,13 +268,15 @@ Alternatively you can build separate test binaries, e.g. honk_tests or numeric_t
 
 Code is formatted using `clang-format` and the `./cpp/format.sh` script which is called via a git pre-commit hook.
 
->[!TIP]
+> [!TIP]
 > A default configuration for VS Code is provided by the file [`barretenberg.code-workspace`](barretenberg.code-workspace). These settings can be overridden by placing configuration files in `.vscode/`.
 > If you've installed the C++ Vscode extension, configure it to format on save!
 
 ### Testing
 
-Each module has its own tests. e.g. To build and run `ecc` tests:
+Each module has its own tests. See `./cpp/scripts/bb-tests.sh` for an exhaustive list of test module names.
+
+e.g. To build and run `ecc` tests:
 
 ```bash
 # Replace the `default` preset with whichever preset you want to use
@@ -393,7 +396,7 @@ cmake --build --preset default --target run_ecc_bench
 
 #### Debugging Verifification Failures
 
-The CicuitChecker::check_circuit function is used to get the gate index and block information about a failing circuit constraint.
+The CircuitChecker::check_circuit function is used to get the gate index and block information about a failing circuit constraint.
 If you are in a scenario where you have a failing call to check_circuit and wish to get more information out of it than just the gate index, you can use this feature to get a stack trace, see example below.
 
 Usage instructions:
@@ -405,7 +408,7 @@ Usage instructions:
 Caveats:
 
 - This works best for code that is not overly generic, i.e. where just the sequence of function calls carries a lot of information. It is possible to tag extra data along with the stack trace, this can be done as a followup, please leave feedback if desired.
-- There are certain functions like `assert_equals` that can cause gates that occur *before* them to fail. If this would be useful to automatically report, please leave feedback.
+- There are certain functions like `assert_equals` that can cause gates that occur _before_ them to fail. If this would be useful to automatically report, please leave feedback.
 
 Example:
 

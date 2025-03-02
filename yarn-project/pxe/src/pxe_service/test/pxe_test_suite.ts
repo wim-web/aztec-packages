@@ -1,18 +1,15 @@
+import { INITIAL_L2_BLOCK_NUM } from '@aztec/constants';
+import { Fr } from '@aztec/foundation/fields';
+import { AztecAddress } from '@aztec/stdlib/aztec-address';
+import { getContractClassFromArtifact } from '@aztec/stdlib/contract';
+import type { PXE } from '@aztec/stdlib/interfaces/client';
 import {
-  type PXE,
   randomContractArtifact,
   randomContractInstanceWithAddress,
   randomDeployedContract,
-} from '@aztec/circuit-types';
-import {
-  AztecAddress,
-  CompleteAddress,
-  Fr,
-  INITIAL_L2_BLOCK_NUM,
-  Point,
-  PublicKeys,
-  getContractClassFromArtifact,
-} from '@aztec/circuits.js';
+} from '@aztec/stdlib/testing';
+
+import omit from 'lodash.omit';
 
 export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => {
   describe(testName, () => {
@@ -29,33 +26,7 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
 
       // Check that the account is correctly registered using the getAccounts and getRecipients methods
       const accounts = await pxe.getRegisteredAccounts();
-      const recipients = await pxe.getRecipients();
       expect(accounts).toContainEqual(completeAddress);
-      expect(recipients).not.toContainEqual(completeAddress);
-
-      // Check that the account is correctly registered using the getAccount and getRecipient methods
-      const account = await pxe.getRegisteredAccount(completeAddress.address);
-      const recipient = await pxe.getRecipient(completeAddress.address);
-      expect(account).toEqual(completeAddress);
-      expect(recipient).toBeUndefined();
-    });
-
-    it('registers a recipient and returns it as a recipient only and not as an account', async () => {
-      const completeAddress = CompleteAddress.random();
-
-      await pxe.registerRecipient(completeAddress);
-
-      // Check that the recipient is correctly registered using the getAccounts and getRecipients methods
-      const accounts = await pxe.getRegisteredAccounts();
-      const recipients = await pxe.getRecipients();
-      expect(accounts).not.toContainEqual(completeAddress);
-      expect(recipients).toContainEqual(completeAddress);
-
-      // Check that the recipient is correctly registered using the getAccount and getRecipient methods
-      const account = await pxe.getRegisteredAccount(completeAddress.address);
-      const recipient = await pxe.getRecipient(completeAddress.address);
-      expect(account).toBeUndefined();
-      expect(recipient).toEqual(completeAddress);
     });
 
     it('does not throw when registering the same account twice (just ignores the second attempt)', async () => {
@@ -66,30 +37,8 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
       await pxe.registerAccount(randomSecretKey, randomPartialAddress);
     });
 
-    // Disabled as CompleteAddress constructor now performs preimage validation.
-    it.skip('cannot register a recipient with the same aztec address but different pub key or partial address', async () => {
-      const recipient1 = CompleteAddress.random();
-      const recipient2 = new CompleteAddress(
-        recipient1.address,
-        new PublicKeys(Point.random(), Point.random(), Point.random(), Point.random()),
-        Fr.random(),
-      );
-
-      await pxe.registerRecipient(recipient1);
-      await expect(() => pxe.registerRecipient(recipient2)).rejects.toThrow(
-        `Complete address with aztec address ${recipient1.address}`,
-      );
-    });
-
-    it('does not throw when registering the same recipient twice (just ignores the second attempt)', async () => {
-      const completeAddress = CompleteAddress.random();
-
-      await pxe.registerRecipient(completeAddress);
-      await pxe.registerRecipient(completeAddress);
-    });
-
     it('successfully adds a contract', async () => {
-      const contracts = [randomDeployedContract(), randomDeployedContract()];
+      const contracts = await Promise.all([randomDeployedContract(), randomDeployedContract()]);
       for (const contract of contracts) {
         await pxe.registerContract(contract);
       }
@@ -101,27 +50,29 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
 
     it('registers a class and adds a contract for it', async () => {
       const artifact = randomContractArtifact();
-      const contractClass = getContractClassFromArtifact(artifact);
+      const contractClass = await getContractClassFromArtifact(artifact);
       const contractClassId = contractClass.id;
-      const instance = randomContractInstanceWithAddress({ contractClassId });
+      const instance = await randomContractInstanceWithAddress({ contractClassId });
 
       await pxe.registerContractClass(artifact);
-      expect(await pxe.getContractClass(contractClassId)).toEqual(contractClass);
+      expect((await pxe.getContractClassMetadata(contractClassId)).contractClass).toMatchObject(
+        omit(contractClass, 'privateFunctionsRoot', 'publicBytecodeCommitment'),
+      );
 
       await pxe.registerContract({ instance });
-      expect(await pxe.getContractInstance(instance.address)).toEqual(instance);
+      expect((await pxe.getContractMetadata(instance.address)).contractInstance).toEqual(instance);
     });
 
     it('refuses to register a class with a mismatched address', async () => {
       const artifact = randomContractArtifact();
-      const contractClass = getContractClassFromArtifact(artifact);
+      const contractClass = await getContractClassFromArtifact(artifact);
       const contractClassId = contractClass.id;
-      const instance = randomContractInstanceWithAddress({ contractClassId });
+      const instance = await randomContractInstanceWithAddress({ contractClassId });
       await expect(
         pxe.registerContract({
           instance: {
             ...instance,
-            address: Fr.random(),
+            address: await AztecAddress.random(),
           },
           artifact,
         }),
@@ -129,13 +80,13 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
     });
 
     it('refuses to register a contract with a class that has not been registered', async () => {
-      const instance = randomContractInstanceWithAddress();
+      const instance = await randomContractInstanceWithAddress();
       await expect(pxe.registerContract({ instance })).rejects.toThrow(/Missing contract artifact/i);
     });
 
     it('refuses to register a contract with an artifact with mismatching class id', async () => {
       const artifact = randomContractArtifact();
-      const instance = randomContractInstanceWithAddress();
+      const instance = await randomContractInstanceWithAddress();
       await expect(pxe.registerContract({ instance, artifact })).rejects.toThrow(/Artifact does not match/i);
     });
 
@@ -143,13 +94,13 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
     //       a larger setup and it's sufficiently tested in the e2e tests.
 
     it('throws when getting public storage for non-existent contract', async () => {
-      const contract = AztecAddress.random();
+      const contract = await AztecAddress.random();
       await expect(async () => await pxe.getPublicStorageAt(contract, new Fr(0n))).rejects.toThrow(
         `Contract ${contract.toString()} is not deployed`,
       );
     });
 
-    // Note: Not testing `getContractData` and `getUnencryptedLogs` here as these
+    // Note: Not testing `getContractData` and `getPublicLogs` here as these
     //       functions only call AztecNode and these methods are frequently used by the e2e tests.
 
     it('successfully gets a block number', async () => {
@@ -163,8 +114,5 @@ export const pxeTestSuite = (testName: string, pxeSetup: () => Promise<PXE>) => 
       expect(typeof nodeInfo.l1ChainId).toEqual('number');
       expect(nodeInfo.l1ContractAddresses.rollupAddress.toString()).toMatch(/0x[a-fA-F0-9]+/);
     });
-
-    // Note: Not testing `isGlobalStateSynchronized`, `isAccountStateSynchronized` and `getSyncStatus` as these methods
-    //       only call synchronizer.
   });
 };

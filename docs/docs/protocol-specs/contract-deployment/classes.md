@@ -12,7 +12,7 @@ Read the following discussions for additional context:
 - [Abstracting contract deployment](https://forum.aztec.network/t/proposal-abstracting-contract-deployment/2576)
 - [Implementing contract upgrades](https://forum.aztec.network/t/implementing-contract-upgrades/2570)
 - [Contract classes, upgrades, and default accounts](https://forum.aztec.network/t/contract-classes-upgrades-and-default-accounts/433)
-  
+
 :::
 
 ## `ContractClass`
@@ -240,7 +240,7 @@ fn register(
 
   emit_nullifier(contract_class_id);
 
-  emit_unencrypted_event(ContractClassRegistered::new(
+  emit_public_log(ContractClassRegistered::new(
     contract_class_id,
     version,
     artifact_hash,
@@ -277,7 +277,7 @@ fn broadcast_private_function(
   artifact_function_tree_leaf_index: Field,
   function: { selector: Field, metadata_hash: Field, vk_hash: Field, bytecode: Field[] },
 )
-  emit_unencrypted_event ClassPrivateFunctionBroadcasted(
+  emit_public_log ClassPrivateFunctionBroadcasted(
     contract_class_id,
     artifact_metadata_hash,
     unconstrained_functions_artifact_tree_root,
@@ -298,7 +298,7 @@ fn broadcast_unconstrained_function(
   artifact_function_tree_leaf_index: Field
   function: { selector: Field, metadata_hash: Field, bytecode: Field[] }[],
 )
-  emit_unencrypted_event ClassUnconstrainedFunctionBroadcasted(
+  emit_public_log ClassUnconstrainedFunctionBroadcasted(
     contract_class_id,
     artifact_metadata_hash,
     private_functions_artifact_tree_root,
@@ -351,7 +351,7 @@ It is strongly recommended for developers registering new classes to broadcast t
 
 The `register`, `broadcast_unconstrained_function`, and `broadcast_private_function` functions all receive and emit variable-length bytecode in unencrypted events. In every function, bytecode is encoded in a fixed-length array of field elements, which sets a maximum length for each:
 
-- `MAX_PACKED_PUBLIC_BYTECODE_SIZE_IN_FIELDS`: 32000 field elements, used for a contract's public bytecode in the `register` function.
+- `MAX_PACKED_PUBLIC_BYTECODE_SIZE_IN_FIELDS`: 3000 field elements, used for a contract's public bytecode in the `register` function.
 - `MAX_PACKED_BYTECODE_SIZE_PER_PRIVATE_FUNCTION_IN_FIELDS`: 3000 field elements, used for the ACIR and Brillig bytecode of a broadcasted private function in `broadcast_private_function`.
 - `MAX_PACKED_BYTECODE_SIZE_PER_UNCONSTRAINED_FUNCTION_IN_FIELDS`: 3000 field elements, used for the Brillig bytecode of a broadcasted unconstrained function in `broadcast_unconstrained_function`.
 

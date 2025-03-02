@@ -1,20 +1,26 @@
 use dep::aztec::macros::aztec;
 
 #[aztec]
-contract ContractInstanceDeployer {
+pub contract ContractInstanceDeployer {
+    use dep::aztec::macros::{events::event, functions::{private, public, view}, storage::storage};
+    use dep::aztec::prelude::{Map, SharedMutable};
     use dep::aztec::protocol_types::{
-        address::{AztecAddress, PublicKeysHash, PartialAddress}, contract_class_id::ContractClassId,
-        constants::DEPLOYER_CONTRACT_INSTANCE_DEPLOYED_MAGIC_VALUE, abis::log_hash::LogHash,
-        traits::Serialize
+        address::{AztecAddress, PartialAddress},
+        constants::{
+            DEFAULT_UPDATE_DELAY, DEPLOYER_CONTRACT_INSTANCE_DEPLOYED_MAGIC_VALUE,
+            DEPLOYER_CONTRACT_INSTANCE_UPDATED_MAGIC_VALUE, MINIMUM_UPDATE_DELAY,
+            REGISTERER_CONTRACT_ADDRESS,
+        },
+        contract_class_id::ContractClassId,
+        public_keys::PublicKeys,
+        traits::{Serialize, ToField},
+        utils::arrays::array_concat,
     };
-    use dep::aztec::{
-        hash::compute_unencrypted_log_hash, oracle::logs::emit_unencrypted_log_private,
-        macros::{events::event, functions::private}, utils::to_bytes::arr_to_be_bytes_arr
-    };
+    use dep::contract_class_registerer::ContractClassRegisterer;
     use std::meta::derive;
 
-    #[event]
     #[derive(Serialize)]
+    #[event]
     struct ContractInstanceDeployed {
         DEPLOYER_CONTRACT_INSTANCE_DEPLOYED_MAGIC_VALUE: Field,
         address: AztecAddress,
@@ -22,8 +28,74 @@ contract ContractInstanceDeployer {
         salt: Field,
         contract_class_id: ContractClassId,
         initialization_hash: Field,
-        public_keys_hash: PublicKeysHash,
+        public_keys: PublicKeys,
         deployer: AztecAddress,
+    }
+
+    // We need to impl this separately because ts deserializes a point as two fields only.
+    // We had issues that:
+    // Notice how the 'is_infinite' field is deserialized as the next point.
+    // {
+    //     masterNullifierPublicKey: Point {
+    //   x: Fr<0x0000000000000000000000000000000000000000000000000000000000000012>,
+    //   y: Fr<0x0000000000000000000000000000000000000000000000000000000000000034>,
+    //   isInfinite: false,
+    //   kind: 'point'
+    // },
+    // masterIncomingViewingPublicKey: Point {
+    //   x: Fr<0x0000000000000000000000000000000000000000000000000000000000000000>,
+    //   y: Fr<0x0000000000000000000000000000000000000000000000000000000000000056>,
+    //   isInfinite: false,
+    //   kind: 'point'
+    // },
+    // masterOutgoingViewingPublicKey: Point {
+    //   x: Fr<0x0000000000000000000000000000000000000000000000000000000000000078>,
+    //   y: Fr<0x0000000000000000000000000000000000000000000000000000000000000000>,
+    //   isInfinite: false,
+    //   kind: 'point'
+    // },
+    // masterTaggingPublicKey: Point {
+    //   x: Fr<0x0000000000000000000000000000000000000000000000000000000000000910>,
+    //   y: Fr<0x0000000000000000000000000000000000000000000000000000000000001112>,
+    //   isInfinite: false,
+    //   kind: 'point'
+    // }
+
+    impl ContractInstanceDeployed {
+        fn serialize_non_standard(self) -> [Field; 15] {
+            [
+                self.DEPLOYER_CONTRACT_INSTANCE_DEPLOYED_MAGIC_VALUE,
+                self.address.to_field(),
+                self.version.to_field(),
+                self.salt,
+                self.contract_class_id.to_field(),
+                self.initialization_hash,
+                self.public_keys.npk_m.serialize()[0],
+                self.public_keys.npk_m.serialize()[1],
+                self.public_keys.ivpk_m.serialize()[0],
+                self.public_keys.ivpk_m.serialize()[1],
+                self.public_keys.ovpk_m.serialize()[0],
+                self.public_keys.ovpk_m.serialize()[1],
+                self.public_keys.tpk_m.serialize()[0],
+                self.public_keys.tpk_m.serialize()[1],
+                self.deployer.to_field(),
+            ]
+        }
+    }
+
+    #[derive(Serialize)]
+    #[event]
+    struct ContractInstanceUpdated {
+        DEPLOYER_CONTRACT_INSTANCE_UPDATED_MAGIC_VALUE: Field,
+        address: AztecAddress,
+        prev_contract_class_id: ContractClassId,
+        new_contract_class_id: ContractClassId,
+        block_of_change: u32,
+    }
+
+    #[storage]
+    struct Storage<Context> {
+        updated_class_ids: Map<AztecAddress, SharedMutable<ContractClassId, DEFAULT_UPDATE_DELAY, Context>, Context>,
     }
 
     #[private]
@@ -31,10 +103,13 @@ contract ContractInstanceDeployer {
         salt: Field,
         contract_class_id: ContractClassId,
         initialization_hash: Field,
-        public_keys_hash: PublicKeysHash,
-        universal_deploy: bool
+        public_keys: PublicKeys,
+        universal_deploy: bool,
     ) {
-        // TODO(@spalladino): assert nullifier_exists silo(contract_class_id, ContractClassRegisterer)
+        // contract class must be registered to deploy an instance
+        ContractClassRegisterer::at(REGISTERER_CONTRACT_ADDRESS)
+            .assert_class_id_is_registered(contract_class_id)
+            .call(&mut context);
 
         let deployer = if universal_deploy {
             AztecAddress::zero()
@@ -42,9 +117,10 @@ contract ContractInstanceDeployer {
             context.msg_sender()
         };
 
-        let partial_address = PartialAddress::compute(contract_class_id, salt, initialization_hash, deployer);
+        let partial_address =
+            PartialAddress::compute(contract_class_id, salt, initialization_hash, deployer);
 
-        let address = AztecAddress::compute(public_keys_hash, partial_address);
+        let address = AztecAddress::compute(public_keys, partial_address);
 
         // Emit the address as a nullifier to be able to prove that this instance has been (not) deployed
         context.push_nullifier(address.to_field());
@@ -54,30 +130,68 @@ contract ContractInstanceDeployer {
             DEPLOYER_CONTRACT_INSTANCE_DEPLOYED_MAGIC_VALUE,
             contract_class_id,
             address,
-            public_keys_hash,
+            public_keys,
             initialization_hash,
             salt,
             deployer,
-            version: 1
+            version: 1,
         };
 
-        let payload = event.serialize();
+        let payload = event.serialize_non_standard();
         dep::aztec::oracle::debug_log::debug_log_format("ContractInstanceDeployed: {}", payload);
 
-        let contract_address = context.this_address();
-        let counter = context.next_counter();
+        let padded_log = array_concat(payload, [0; 3]);
+        context.emit_private_log(padded_log);
+    }
 
-        // @todo This is very inefficient, we are doing a lot of back and forth conversions.
-        let serialized_log = arr_to_be_bytes_arr(payload);
-        let log_hash = compute_unencrypted_log_hash(contract_address, serialized_log);
-        // 40 = addr (32) + raw log len (4) + processed log len (4)
-        let len = 40 + serialized_log.len().to_field();
-        let side_effect = LogHash { value: log_hash, counter, length: len };
+    #[public]
+    fn update(new_contract_class_id: ContractClassId) {
+        let address = context.msg_sender();
 
-        // We manually push the unencrypted log to the context and inform the execution environment about this because
-        // PrivateContext does not expose an `emit_unencrypted_log` method - this mechanism is considered error-prone
-        // and only some canonical contracts use it.
-        context.unencrypted_logs_hashes.push(side_effect);
-        emit_unencrypted_log_private(contract_address, payload, counter);
+        assert(
+            context.nullifier_exists(address.to_field(), context.this_address()),
+            "msg.sender is not deployed",
+        );
+
+        assert(
+            context.nullifier_exists(new_contract_class_id.to_field(), REGISTERER_CONTRACT_ADDRESS),
+            "New contract class is not registered",
+        );
+
+        let scheduled_value_update = storage
+            .updated_class_ids
+            .at(address)
+            .schedule_and_return_value_change(new_contract_class_id);
+        let (prev_contract_class_id, block_of_change) = scheduled_value_update.get_previous();
+
+        let event = ContractInstanceUpdated {
+            DEPLOYER_CONTRACT_INSTANCE_UPDATED_MAGIC_VALUE,
+            address,
+            prev_contract_class_id,
+            new_contract_class_id,
+            block_of_change,
+        };
+
+        context.emit_public_log(event);
+    }
+
+    #[public]
+    fn set_update_delay(new_update_delay: u32) {
+        let address = context.msg_sender();
+
+        assert(
+            context.nullifier_exists(address.to_field(), context.this_address()),
+            "msg.sender is not deployed",
+        );
+
+        assert(new_update_delay >= MINIMUM_UPDATE_DELAY, "New update delay is too low");
+
+        storage.updated_class_ids.at(address).schedule_delay_change(new_update_delay);
+    }
+
+    #[public]
+    #[view]
+    fn get_update_delay() -> u32 {
+        storage.updated_class_ids.at(context.msg_sender()).get_current_delay()
     }
 }

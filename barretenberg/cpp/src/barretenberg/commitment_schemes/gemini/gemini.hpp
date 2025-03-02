@@ -1,6 +1,7 @@
 #pragma once
 
 #include "barretenberg/commitment_schemes/claim.hpp"
+#include "barretenberg/commitment_schemes/claim_batcher.hpp"
 #include "barretenberg/polynomials/polynomial.hpp"
 #include "barretenberg/transcript/transcript.hpp"
 
@@ -100,28 +101,184 @@ template <typename Curve> class GeminiProver_ {
     using Claim = ProverOpeningClaim<Curve>;
 
   public:
-    static std::vector<Polynomial> compute_fold_polynomials(const size_t log_N,
-                                                            std::span<const Fr> multilinear_challenge,
-                                                            Polynomial&& batched_unshifted,
-                                                            Polynomial&& batched_to_be_shifted);
+    /**
+     * @brief Class responsible for computation of the batched multilinear polynomials required by the Gemini protocol
+     * @details Opening multivariate polynomials using Gemini requires the computation of three batched polynomials. The
+     * first, here denoted A₀, is a linear combination of all polynomials to be opened. If we denote the linear
+     * combinations (based on challenge rho) of the unshifted, to-be-shifted-by-1, and to-be-right-shifted-by-k
+     * polynomials by F, G, and H respectively, then A₀ = F + G/X + X^k*H. (Note: 'k' is assumed even and thus a factor
+     * (-1)^k in not needed for the evaluation at -r). This polynomial is "folded" in Gemini to produce d-1 univariate
+     * polynomials Fold_i, i = 1, ..., d-1. The second and third are the partially evaluated batched polynomials A₀₊ = F
+     * + G/r + r^K*H, and A₀₋ = F - G/r + r^K*H. These are required in order to prove the opening of shifted polynomials
+     * G_i/X, X^k*H_i and from the commitments to their unshifted counterparts G_i and H_i.
+     * @note TODO(https://github.com/AztecProtocol/barretenberg/issues/1223): There are certain operations herein that
+     * could be made more efficient by e.g. reusing already initialized polynomials, possibly at the expense of clarity.
+     */
+    class PolynomialBatcher {
 
-    static std::vector<Claim> compute_fold_polynomial_evaluations(const size_t log_N,
+        size_t full_batched_size = 0; // size of the full batched polynomial (generally the circuit size)
+        bool batched_unshifted_initialized = false;
+
+        Polynomial random_polynomial; // random polynomial used for ZK
+        bool has_random_polynomial = false;
+
+        RefVector<Polynomial> unshifted;            // set of unshifted polynomials
+        RefVector<Polynomial> to_be_shifted_by_one; // set of polynomials to be left shifted by 1
+        RefVector<Polynomial> to_be_shifted_by_k;   // set of polynomials to be right shifted by k
+
+        size_t k_shift_magnitude = 0; // magnitude of right-shift-by-k (assumed even)
+
+        Polynomial batched_unshifted;            // linear combination of unshifted polynomials
+        Polynomial batched_to_be_shifted_by_one; // linear combination of to-be-shifted polynomials
+        Polynomial batched_to_be_shifted_by_k;   // linear combination of to-be-shifted-by-k polynomials
+
+      public:
+        PolynomialBatcher(const size_t full_batched_size)
+            : full_batched_size(full_batched_size)
+            , batched_unshifted(full_batched_size)
+            , batched_to_be_shifted_by_one(Polynomial::shiftable(full_batched_size))
+        {}
+
+        bool has_unshifted() const { return unshifted.size() > 0; }
+        bool has_to_be_shifted_by_one() const { return to_be_shifted_by_one.size() > 0; }
+        bool has_to_be_shifted_by_k() const { return to_be_shifted_by_k.size() > 0; }
+
+        // Set references to the polynomials to be batched
+        void set_unshifted(RefVector<Polynomial> polynomials) { unshifted = polynomials; }
+        void set_to_be_shifted_by_one(RefVector<Polynomial> polynomials) { to_be_shifted_by_one = polynomials; }
+        void set_to_be_shifted_by_k(RefVector<Polynomial> polynomials, const size_t shift_magnitude)
+        {
+            ASSERT(k_shift_magnitude % 2 == 0); // k must be even for the formulas herein to be valid
+            to_be_shifted_by_k = polynomials;
+            k_shift_magnitude = shift_magnitude;
+        }
+
+        // Initialize the random polynomial used to add randomness to the batched polynomials for ZK
+        void set_random_polynomial(Polynomial&& random)
+        {
+            has_random_polynomial = true;
+            random_polynomial = random;
+        }
+
+        /**
+         * @brief Compute batched polynomial A₀ = F + G/X as the linear combination of all polynomials to be opened
+         * @details If the random polynomial is set, it is added to the batched polynomial for ZK
+         *
+         * @param challenge batching challenge
+         * @param running_scalar power of the batching challenge
+         * @return Polynomial A₀
+         */
+        Polynomial compute_batched(const Fr& challenge, Fr& running_scalar)
+        {
+            // lambda for batching polynomials; updates the running scalar in place
+            auto batch = [&](Polynomial& batched, const RefVector<Polynomial>& polynomials_to_batch) {
+                for (auto& poly : polynomials_to_batch) {
+                    batched.add_scaled(poly, running_scalar);
+                    running_scalar *= challenge;
+                }
+            };
+
+            Polynomial full_batched(full_batched_size);
+
+            // if necessary, add randomness to the full batched polynomial for ZK
+            if (has_random_polynomial) {
+                full_batched += random_polynomial; // A₀ += rand
+            }
+
+            // compute the linear combination F of the unshifted polynomials
+            if (has_unshifted()) {
+                batch(batched_unshifted, unshifted);
+                full_batched += batched_unshifted; // A₀ += F
+            }
+
+            // compute the linear combination G of the to-be-shifted polynomials
+            if (has_to_be_shifted_by_one()) {
+                batch(batched_to_be_shifted_by_one, to_be_shifted_by_one);
+                full_batched += batched_to_be_shifted_by_one.shifted(); // A₀ += G/X
+            }
+
+            // compute the linear combination H of the to-be-shifted-by-k polynomials
+            if (has_to_be_shifted_by_k()) {
+                batched_to_be_shifted_by_k = Polynomial(full_batched_size - k_shift_magnitude, full_batched_size, 0);
+                batch(batched_to_be_shifted_by_k, to_be_shifted_by_k);
+                full_batched += batched_to_be_shifted_by_k.right_shifted(k_shift_magnitude); // A₀ += X^k * H
+            }
+
+            return full_batched;
+        }
+
+        /**
+         * @brief Compute partially evaluated batched polynomials A₀(X, r) = A₀₊ = F + G/r, A₀(X, -r) = A₀₋ = F - G/r
+         * @details If the random polynomial is set, it is added to each batched polynomial for ZK
+         *
+         * @param r_challenge partial evaluation challenge
+         * @return std::pair<Polynomial, Polynomial> {A₀₊, A₀₋}
+         */
+        std::pair<Polynomial, Polynomial> compute_partially_evaluated_batch_polynomials(const Fr& r_challenge)
+        {
+            // Initialize A₀₊ and compute A₀₊ += Random and A₀₊ += F as necessary
+            Polynomial A_0_pos(full_batched_size); // A₀₊
+
+            if (has_random_polynomial) {
+                A_0_pos += random_polynomial; // A₀₊ += random
+            }
+            if (has_unshifted()) {
+                A_0_pos += batched_unshifted; // A₀₊ += F
+            }
+
+            if (has_to_be_shifted_by_k()) {
+                Fr r_pow_k = r_challenge.pow(k_shift_magnitude); // r^k
+                batched_to_be_shifted_by_k *= r_pow_k;
+                A_0_pos += batched_to_be_shifted_by_k; // A₀₊ += r^k * H
+            }
+
+            Polynomial A_0_neg = A_0_pos;
+
+            if (has_to_be_shifted_by_one()) {
+                Fr r_inv = r_challenge.invert();       // r⁻¹
+                batched_to_be_shifted_by_one *= r_inv; // G = G/r
+
+                A_0_pos += batched_to_be_shifted_by_one; // A₀₊ += G/r
+                A_0_neg -= batched_to_be_shifted_by_one; // A₀₋ -= G/r
+            }
+
+            return { A_0_pos, A_0_neg };
+        };
+    };
+
+    static std::vector<Polynomial> compute_fold_polynomials(const size_t log_n,
+                                                            std::span<const Fr> multilinear_challenge,
+                                                            const Polynomial& A_0);
+
+    static std::pair<Polynomial, Polynomial> compute_partially_evaluated_batch_polynomials(
+        const size_t log_n,
+        PolynomialBatcher& polynomial_batcher,
+        const Fr& r_challenge,
+        const std::vector<Polynomial>& batched_groups_to_be_concatenated = {});
+
+    static std::vector<Claim> construct_univariate_opening_claims(const size_t log_n,
+                                                                  Polynomial&& A_0_pos,
+                                                                  Polynomial&& A_0_neg,
                                                                   std::vector<Polynomial>&& fold_polynomials,
                                                                   const Fr& r_challenge);
 
     template <typename Transcript>
     static std::vector<Claim> prove(const Fr circuit_size,
-                                    RefSpan<Polynomial> f_polynomials,
-                                    RefSpan<Polynomial> g_polynomials,
+                                    PolynomialBatcher& polynomial_batcher,
                                     std::span<Fr> multilinear_challenge,
                                     const std::shared_ptr<CommitmentKey<Curve>>& commitment_key,
-                                    const std::shared_ptr<Transcript>& transcript);
+                                    const std::shared_ptr<Transcript>& transcript,
+                                    RefSpan<Polynomial> concatenated_polynomials = {},
+                                    const std::vector<RefVector<Polynomial>>& groups_to_be_concatenated = {},
+                                    bool has_zk = false);
+
 }; // namespace bb
 
 template <typename Curve> class GeminiVerifier_ {
     using Fr = typename Curve::ScalarField;
     using GroupElement = typename Curve::Element;
     using Commitment = typename Curve::AffineElement;
+    using ClaimBatcher = ClaimBatcher_<Curve>;
 
   public:
     /**
@@ -136,32 +293,37 @@ template <typename Curve> class GeminiVerifier_ {
      * @return Fold polynomial opening claims: (r, A₀(r), C₀₊), (-r, A₀(-r), C₀₋), and
      * (Cⱼ, Aⱼ(-r^{2ʲ}), -r^{2}), j = [1, ..., m-1]
      */
-    static std::vector<OpeningClaim<Curve>> reduce_verification(std::span<Fr> multilinear_challenge,
-                                                                std::span<Fr> multilinear_evaluations,
-                                                                RefSpan<GroupElement> unshifted_commitments,
-                                                                RefSpan<GroupElement> to_be_shifted_commitments,
-                                                                auto& transcript)
+    static std::vector<OpeningClaim<Curve>> reduce_verification(
+        std::span<Fr> multilinear_challenge,
+        ClaimBatcher& claim_batcher,
+        auto& transcript,
+        const std::vector<RefVector<Commitment>>& concatenation_group_commitments = {},
+        RefSpan<Fr> concatenated_evaluations = {})
+
     {
         const size_t num_variables = multilinear_challenge.size();
 
+        const size_t N = 1 << num_variables;
+
         Fr rho = transcript->template get_challenge<Fr>("rho");
-        std::vector<Fr> rhos = gemini::powers_of_rho(rho, multilinear_evaluations.size());
 
         GroupElement batched_commitment_unshifted = GroupElement::zero();
         GroupElement batched_commitment_to_be_shifted = GroupElement::zero();
 
-        Fr batched_evaluation = Fr::zero();
-        for (size_t i = 0; i < multilinear_evaluations.size(); ++i) {
-            batched_evaluation += multilinear_evaluations[i] * rhos[i];
+        Fr batched_evaluation = Fr(0);
+        Fr batching_scalar = Fr(1);
+        for (auto [eval, comm] :
+             zip_view(claim_batcher.get_unshifted().evaluations, claim_batcher.get_unshifted().commitments)) {
+            batched_evaluation += eval * batching_scalar;
+            batched_commitment_unshifted += comm * batching_scalar;
+            batching_scalar *= rho;
         }
 
-        const size_t num_unshifted = unshifted_commitments.size();
-        const size_t num_to_be_shifted = to_be_shifted_commitments.size();
-        for (size_t i = 0; i < num_unshifted; i++) {
-            batched_commitment_unshifted += unshifted_commitments[i] * rhos[i];
-        }
-        for (size_t i = 0; i < num_to_be_shifted; i++) {
-            batched_commitment_to_be_shifted += to_be_shifted_commitments[i] * rhos[num_unshifted + i];
+        for (auto [eval, comm] :
+             zip_view(claim_batcher.get_shifted().evaluations, claim_batcher.get_shifted().commitments)) {
+            batched_evaluation += eval * batching_scalar;
+            batched_commitment_to_be_shifted += comm * batching_scalar;
+            batching_scalar *= rho;
         }
 
         // Get polynomials Fold_i, i = 1,...,m-1 from transcript
@@ -173,22 +335,71 @@ template <typename Curve> class GeminiVerifier_ {
 
         // Get evaluations a_i, i = 0,...,m-1 from transcript
         const std::vector<Fr> evaluations = get_gemini_evaluations(num_variables, transcript);
+
+        // C₀_r_pos = ∑ⱼ ρʲ⋅[fⱼ] + r⁻¹⋅∑ⱼ ρᵏ⁺ʲ [gⱼ], the commitment to A₀₊
+        // C₀_r_neg = ∑ⱼ ρʲ⋅[fⱼ] - r⁻¹⋅∑ⱼ ρᵏ⁺ʲ [gⱼ], the commitment to  A₀₋
+        GroupElement C0_r_pos = batched_commitment_unshifted;
+        GroupElement C0_r_neg = batched_commitment_unshifted;
+
+        Fr r_inv = r.invert();
+        if (!batched_commitment_to_be_shifted.is_point_at_infinity()) {
+            batched_commitment_to_be_shifted = batched_commitment_to_be_shifted * r_inv;
+            C0_r_pos += batched_commitment_to_be_shifted;
+            C0_r_neg -= batched_commitment_to_be_shifted;
+        }
+
+        // If verifying the opening for the translator VM, we reconstruct the commitment of the batched concatenated
+        // polynomials, partially evaluated in r and -r, using the commitments in the concatenation groups and add their
+        // contribution as well to to C₀_r_pos and C₀_r_neg
+        ASSERT(concatenated_evaluations.size() == concatenation_group_commitments.size());
+        if (!concatenation_group_commitments.empty()) {
+            size_t concatenation_group_size = concatenation_group_commitments[0].size();
+            // The "real" size of polynomials in concatenation groups (i.e. the number of non-zero values)
+            const size_t mini_circuit_size = N / concatenation_group_size;
+            Fr current_r_shift_pos = Fr(1);
+            Fr current_r_shift_neg = Fr(1);
+            const Fr r_pow_minicircuit = r.pow(mini_circuit_size);
+            const Fr r_neg_pow_minicircuit = (-r).pow(mini_circuit_size);
+            std::vector<Fr> r_shifts_pos;
+            std::vector<Fr> r_shifts_neg;
+            for (size_t i = 0; i < concatenation_group_size; ++i) {
+                r_shifts_pos.emplace_back(current_r_shift_pos);
+                r_shifts_neg.emplace_back(current_r_shift_neg);
+                current_r_shift_pos *= r_pow_minicircuit;
+                current_r_shift_neg *= r_neg_pow_minicircuit;
+            }
+            size_t j = 0;
+            GroupElement batched_concatenated_pos = GroupElement::zero();
+            GroupElement batched_concatenated_neg = GroupElement::zero();
+            for (auto& concatenation_group_commitment : concatenation_group_commitments) {
+                // Compute the contribution from each group j of commitments Gⱼ = {C₀, C₁, C₂, C₃, ...}
+                // where s = mini_circuit_size as
+                // C₀_r_pos += ∑ᵢ ρᵏ⁺ᵐ⁺ʲ⋅ rⁱˢ ⋅ Cᵢ
+                // C₀_r_neg += ∑ᵢ ρᵏ⁺ᵐ⁺ʲ⋅ (-r)ⁱˢ ⋅ Cᵢ
+                for (size_t i = 0; i < concatenation_group_size; ++i) {
+                    batched_concatenated_pos += concatenation_group_commitment[i] * batching_scalar * r_shifts_pos[i];
+                    batched_concatenated_neg += concatenation_group_commitment[i] * batching_scalar * r_shifts_neg[i];
+                }
+                batched_evaluation += concatenated_evaluations[j] * batching_scalar;
+                batching_scalar *= rho;
+                j++;
+            }
+
+            // Add the contributions from concatenation groups to get the final [A₀₊] and  [A₀₋]
+            C0_r_pos += batched_concatenated_pos;
+            C0_r_neg += batched_concatenated_neg;
+        }
+
         // Compute evaluation A₀(r)
         auto a_0_pos = compute_gemini_batched_univariate_evaluation(
             num_variables, batched_evaluation, multilinear_challenge, r_squares, evaluations);
-
-        // C₀_r_pos = ∑ⱼ ρʲ⋅[fⱼ] + r⁻¹⋅∑ⱼ ρᵏ⁺ʲ [gⱼ]
-        // C₀_r_pos = ∑ⱼ ρʲ⋅[fⱼ] - r⁻¹⋅∑ⱼ ρᵏ⁺ʲ [gⱼ]
-        auto [c0_r_pos, c0_r_neg] =
-            compute_simulated_commitments(batched_commitment_unshifted, batched_commitment_to_be_shifted, r);
-
         std::vector<OpeningClaim<Curve>> fold_polynomial_opening_claims;
         fold_polynomial_opening_claims.reserve(num_variables + 1);
 
         // ( [A₀₊], r, A₀(r) )
-        fold_polynomial_opening_claims.emplace_back(OpeningClaim<Curve>{ { r, a_0_pos }, c0_r_pos });
+        fold_polynomial_opening_claims.emplace_back(OpeningClaim<Curve>{ { r, a_0_pos }, C0_r_pos });
         // ( [A₀₋], -r, A₀(-r) )
-        fold_polynomial_opening_claims.emplace_back(OpeningClaim<Curve>{ { -r, evaluations[0] }, c0_r_neg });
+        fold_polynomial_opening_claims.emplace_back(OpeningClaim<Curve>{ { -r, evaluations[0] }, C0_r_neg });
         for (size_t l = 0; l < num_variables - 1; ++l) {
             // ([A₀₋], −r^{2ˡ}, Aₗ(−r^{2ˡ}) )
             fold_polynomial_opening_claims.emplace_back(
@@ -269,7 +480,7 @@ template <typename Curve> class GeminiVerifier_ {
 
             if constexpr (Curve::is_stdlib_type) {
                 auto builder = evaluation_point[0].get_context();
-                // TODO(https://github.com/AztecProtocol/barretenberg/issues/1114): insecure!
+                // TODO(https://github.com/AztecProtocol/barretenberg/issues/1114): insecure dummy_round derivation!
                 stdlib::bool_t dummy_round = stdlib::witness_t(builder, l > num_variables);
                 batched_eval_accumulator =
                     Fr::conditional_assign(dummy_round, batched_eval_accumulator, batched_eval_round_acc);
@@ -282,48 +493,6 @@ template <typename Curve> class GeminiVerifier_ {
         }
 
         return batched_eval_accumulator;
-    }
-
-    /**
-     * @brief Computes two commitments to A₀ partially evaluated in r and -r.
-     *
-     * @param batched_commitment_unshifted batched commitment to non-shifted polynomials
-     * @param batched_commitment_to_be_shifted batched commitment to to-be-shifted polynomials
-     * @param r evaluation point at which we have partially evaluated A₀ at r and -r.
-     * @return std::pair<Commitment, Commitment>  c0_r_pos, c0_r_neg
-     */
-    static std::pair<GroupElement, GroupElement> compute_simulated_commitments(
-        GroupElement& batched_commitment_unshifted, GroupElement& batched_commitment_to_be_shifted, Fr r)
-    {
-        // C₀ᵣ₊ = [F] + r⁻¹⋅[G]
-        GroupElement C0_r_pos;
-        // C₀ᵣ₋ = [F] - r⁻¹⋅[G]
-        GroupElement C0_r_neg;
-        Fr r_inv = r.invert(); // r⁻¹
-
-        // If in a recursive setting, perform a batch mul. Otherwise, accumulate directly.
-        // TODO(#673): The following if-else represents the stldib/native code paths. Once the "native" verifier is
-        // achieved through a builder Simulator, the stdlib codepath should become the only codepath.
-        if constexpr (Curve::is_stdlib_type) {
-            std::vector<GroupElement> commitments = { batched_commitment_unshifted, batched_commitment_to_be_shifted };
-            auto builder = r.get_context();
-            auto one = Fr(builder, 1);
-            // TODO(#707): these batch muls include the use of 1 as a scalar. This is handled appropriately as a non-mul
-            // (add-accumulate) in the goblin batch_mul but is done inefficiently as a scalar mul in the conventional
-            // emulated batch mul.
-            C0_r_pos = GroupElement::batch_mul(commitments, { one, r_inv });
-            C0_r_neg = GroupElement::batch_mul(commitments, { one, -r_inv });
-        } else {
-            C0_r_pos = batched_commitment_unshifted;
-            C0_r_neg = batched_commitment_unshifted;
-            if (!batched_commitment_to_be_shifted.is_point_at_infinity()) {
-                batched_commitment_to_be_shifted = batched_commitment_to_be_shifted * r_inv;
-                C0_r_pos += batched_commitment_to_be_shifted;
-                C0_r_neg -= batched_commitment_to_be_shifted;
-            }
-        }
-
-        return { C0_r_pos, C0_r_neg };
     }
 };
 

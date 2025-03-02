@@ -1,5 +1,6 @@
-import { type L1ToL2MessageSource, type L2Block, type L2BlockSource } from '@aztec/circuit-types';
-import { type Fr } from '@aztec/circuits.js';
+import type { Fr } from '@aztec/foundation/fields';
+import type { L2Block, L2BlockSource } from '@aztec/stdlib/block';
+import type { L1ToL2MessageSource } from '@aztec/stdlib/messaging';
 
 import { MockL1ToL2MessageSource } from './mock_l1_to_l2_message_source.js';
 import { MockL2BlockSource } from './mock_l2_block_source.js';
@@ -18,8 +19,8 @@ export class MockArchiver extends MockL2BlockSource implements L2BlockSource, L1
     return this.messageSource.getL1ToL2Messages(blockNumber);
   }
 
-  getL1ToL2MessageIndex(_l1ToL2Message: Fr, _startIndex: bigint): Promise<bigint | undefined> {
-    return this.messageSource.getL1ToL2MessageIndex(_l1ToL2Message, _startIndex);
+  getL1ToL2MessageIndex(_l1ToL2Message: Fr): Promise<bigint | undefined> {
+    return this.messageSource.getL1ToL2MessageIndex(_l1ToL2Message);
   }
 }
 
@@ -51,5 +52,6 @@ export class MockPrefilledArchiver extends MockArchiver {
 
     const fromBlock = this.l2Blocks.length;
     this.addBlocks(this.precomputed.slice(fromBlock, fromBlock + numBlocks));
+    return Promise.resolve();
   }
 }

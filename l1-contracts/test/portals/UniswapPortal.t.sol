@@ -3,7 +3,7 @@ pragma solidity >=0.8.27;
 import "forge-std/Test.sol";
 
 // Rollup Processor
-import {Rollup} from "@aztec/core/Rollup.sol";
+import {Rollup} from "../harnesses/Rollup.sol";
 import {Registry} from "@aztec/governance/Registry.sol";
 import {DataStructures} from "@aztec/core/libraries/DataStructures.sol";
 import {DataStructures as PortalDataStructures} from "./DataStructures.sol";
@@ -14,16 +14,18 @@ import {Errors} from "@aztec/core/libraries/Errors.sol";
 import {IERC20} from "@oz/token/ERC20/IERC20.sol";
 import {IOutbox} from "@aztec/core/interfaces/messagebridge/IOutbox.sol";
 import {NaiveMerkle} from "../merkle/Naive.sol";
-import {IFeeJuicePortal} from "@aztec/core/interfaces/IFeeJuicePortal.sol";
-import {IProofCommitmentEscrow} from "@aztec/core/interfaces/IProofCommitmentEscrow.sol";
 
 // Portals
 import {TokenPortal} from "./TokenPortal.sol";
 import {UniswapPortal} from "./UniswapPortal.sol";
 
 import {MockFeeJuicePortal} from "@aztec/mock/MockFeeJuicePortal.sol";
+import {RewardDistributor} from "@aztec/governance/RewardDistributor.sol";
+
+import {stdStorage, StdStorage} from "forge-std/Test.sol";
 
 contract UniswapPortalTest is Test {
+  using stdStorage for StdStorage;
   using Hash for DataStructures.L2ToL1Msg;
 
   IERC20 public constant DAI = IERC20(0x6B175474E89094C44Da98b954EedeAC495271d0F);
@@ -45,7 +47,6 @@ contract UniswapPortalTest is Test {
   uint24 internal uniswapFeePool = 3000; // 0.3% fee
   uint256 internal amountOutMinimum = 0;
   bytes32 internal aztecRecipient = bytes32(uint256(0x3));
-  bytes32 internal secretHashForRedeemingMintedNotes = bytes32(uint256(0x4));
 
   uint256 internal l2BlockNumber = 69;
 
@@ -55,8 +56,17 @@ contract UniswapPortalTest is Test {
     vm.selectFork(forkId);
 
     registry = new Registry(address(this));
-    rollup =
-      new Rollup(new MockFeeJuicePortal(), bytes32(0), bytes32(0), address(this), new address[](0));
+    RewardDistributor rewardDistributor = new RewardDistributor(DAI, registry, address(this));
+    rollup = new Rollup(
+      new MockFeeJuicePortal(),
+      rewardDistributor,
+      DAI,
+      bytes32(0),
+      bytes32(0),
+      bytes32(0),
+      bytes32(0),
+      address(this)
+    );
     registry.upgrade(address(rollup));
 
     daiTokenPortal = new TokenPortal();
@@ -69,13 +79,15 @@ contract UniswapPortalTest is Test {
     uniswapPortal.initialize(address(registry), l2UniswapAddress);
 
     // Modify the proven block count
-    vm.store(address(rollup), bytes32(uint256(9)), bytes32(l2BlockNumber + 1));
+    vm.store(address(rollup), bytes32(uint256(13)), bytes32(l2BlockNumber + 1));
+
+    stdstore.target(address(rollup)).sig("getProvenBlockNumber()").checked_write(l2BlockNumber + 1);
     assertEq(rollup.getProvenBlockNumber(), l2BlockNumber + 1);
 
     // have DAI locked in portal that can be moved when funds are withdrawn
     deal(address(DAI), address(daiTokenPortal), amount);
 
-    outbox = rollup.OUTBOX();
+    outbox = rollup.getOutbox();
   }
 
   /**
@@ -89,6 +101,8 @@ contract UniswapPortalTest is Test {
     view
     returns (bytes32 l2ToL1MessageHash)
   {
+    // The purpose of including the function selector is to make the message unique to that specific call. Note that
+    // it has nothing to do with calling the function.
     DataStructures.L2ToL1Msg memory message = DataStructures.L2ToL1Msg({
       sender: DataStructures.L2Actor(l2TokenAddress, 1),
       recipient: DataStructures.L1Actor(address(daiTokenPortal), block.chainid),
@@ -111,6 +125,8 @@ contract UniswapPortalTest is Test {
     view
     returns (bytes32 l2ToL1MessageHash)
   {
+    // The purpose of including the function selector is to make the message unique to that specific call. Note that
+    // it has nothing to do with calling the function.
     DataStructures.L2ToL1Msg memory message = DataStructures.L2ToL1Msg({
       sender: DataStructures.L2Actor(l2UniswapAddress, 1),
       recipient: DataStructures.L1Actor(address(uniswapPortal), block.chainid),
@@ -134,26 +150,23 @@ contract UniswapPortalTest is Test {
 
   /**
    * L2 to L1 message to be added to the outbox -
-   * @param _secretHashForRedeemingMintedNotes - The hash of the secret to redeem minted notes privately on Aztec
    * @param _caller - designated caller on L1 that will call the swap function - typically address(this)
    * Set to address(0) if anyone can call.
    */
-  function _createUniswapSwapMessagePrivate(
-    bytes32 _secretHashForRedeemingMintedNotes,
-    address _caller
-  ) internal view returns (bytes32) {
+  function _createUniswapSwapMessagePrivate(address _caller) internal view returns (bytes32) {
+    // The purpose of including the function selector is to make the message unique to that specific call. Note that
+    // it has nothing to do with calling the function.
     DataStructures.L2ToL1Msg memory message = DataStructures.L2ToL1Msg({
       sender: DataStructures.L2Actor(l2UniswapAddress, 1),
       recipient: DataStructures.L1Actor(address(uniswapPortal), block.chainid),
       content: Hash.sha256ToField(
         abi.encodeWithSignature(
-          "swap_private(address,uint256,uint24,address,uint256,bytes32,bytes32,address)",
+          "swap_private(address,uint256,uint24,address,uint256,bytes32,address)",
           address(daiTokenPortal),
           amount,
           uniswapFeePool,
           address(wethTokenPortal),
           amountOutMinimum,
-          _secretHashForRedeemingMintedNotes,
           secretHash,
           _caller
         )
@@ -566,8 +579,7 @@ contract UniswapPortalTest is Test {
       })
     ];
 
-    bytes32 messageHashPortalChecksAgainst =
-      _createUniswapSwapMessagePrivate(secretHashForRedeemingMintedNotes, address(this));
+    bytes32 messageHashPortalChecksAgainst = _createUniswapSwapMessagePrivate(address(this));
 
     bytes32 actualRoot;
     bytes32 consumedRoot;
@@ -601,7 +613,6 @@ contract UniswapPortalTest is Test {
       uniswapFeePool,
       address(wethTokenPortal),
       amountOutMinimum,
-      secretHashForRedeemingMintedNotes,
       secretHash,
       true,
       outboxMessageMetadata

@@ -12,23 +12,32 @@ use lsp_types::{
 };
 use noirc_errors::Span;
 use noirc_frontend::{
-    ast::{ConstructorExpression, ItemVisibility, NoirTraitImpl, Path, UseTree, Visitor},
-    graph::CrateId,
-    hir::def_map::{CrateDefMap, LocalModuleId, ModuleId},
-    node_interner::NodeInterner,
+    ast::{
+        CallExpression, ConstructorExpression, ItemVisibility, MethodCallExpression, NoirTraitImpl,
+        Path, UseTree, Visitor,
+    },
+    graph::{CrateId, Dependency},
+    hir::def_map::{CrateDefMap, LocalModuleId, ModuleDefId, ModuleId},
+    node_interner::{NodeInterner, Reexport},
+    usage_tracker::UsageTracker,
 };
 use noirc_frontend::{
     parser::{Item, ItemKind, ParsedSubModule},
     ParsedModule,
 };
 
-use crate::{utils, LspState};
+use crate::{
+    modules::get_ancestor_module_reexport, use_segment_positions::UseSegmentPositions, utils,
+    visibility::module_def_id_is_visible, LspState,
+};
 
 use super::{process_request, to_lsp_location};
 
 mod fill_struct_fields;
 mod implement_missing_members;
 mod import_or_qualify;
+mod import_trait;
+mod remove_bang_from_call;
 mod remove_unused_import;
 mod tests;
 
@@ -47,7 +56,7 @@ pub(crate) fn on_code_action_request(
             utils::range_to_byte_span(args.files, file_id, &params.range).and_then(|byte_range| {
                 let file = args.files.get_file(file_id).unwrap();
                 let source = file.source();
-                let (parsed_module, _errors) = noirc_frontend::parse_program(source);
+                let (parsed_module, _errors) = noirc_frontend::parse_program(source, file_id);
 
                 let mut finder = CodeActionFinder::new(
                     uri,
@@ -57,7 +66,9 @@ pub(crate) fn on_code_action_request(
                     byte_range,
                     args.crate_id,
                     args.def_maps,
+                    args.dependencies,
                     args.interner,
+                    args.usage_tracker,
                 );
                 finder.find(&parsed_module)
             })
@@ -77,11 +88,14 @@ struct CodeActionFinder<'a> {
     /// if we are analyzing something inside an inline module declaration.
     module_id: ModuleId,
     def_maps: &'a BTreeMap<CrateId, CrateDefMap>,
+    dependencies: &'a Vec<Dependency>,
     interner: &'a NodeInterner,
+    usage_tracker: &'a UsageTracker,
     /// How many nested `mod` we are in deep
     nesting: usize,
     /// The line where an auto_import must be inserted
     auto_import_line: usize,
+    use_segment_positions: UseSegmentPositions,
     /// Text edits for the "Remove all unused imports" code action
     unused_imports_text_edits: Vec<TextEdit>,
     code_actions: Vec<CodeAction>,
@@ -97,7 +111,9 @@ impl<'a> CodeActionFinder<'a> {
         byte_range: Range<usize>,
         krate: CrateId,
         def_maps: &'a BTreeMap<CrateId, CrateDefMap>,
+        dependencies: &'a Vec<Dependency>,
         interner: &'a NodeInterner,
+        usage_tracker: &'a UsageTracker,
     ) -> Self {
         // Find the module the current file belongs to
         let def_map = &def_maps[&krate];
@@ -118,9 +134,12 @@ impl<'a> CodeActionFinder<'a> {
             byte_range,
             module_id,
             def_maps,
+            dependencies,
             interner,
+            usage_tracker,
             nesting: 0,
             auto_import_line: 0,
+            use_segment_positions: UseSegmentPositions::default(),
             unused_imports_text_edits: vec![],
             code_actions: vec![],
         }
@@ -176,21 +195,54 @@ impl<'a> CodeActionFinder<'a> {
         }
     }
 
+    fn module_def_id_is_visible(
+        &self,
+        module_def_id: ModuleDefId,
+        visibility: ItemVisibility,
+        defining_module: Option<ModuleId>,
+    ) -> bool {
+        module_def_id_is_visible(
+            module_def_id,
+            self.module_id,
+            visibility,
+            defining_module,
+            self.interner,
+            self.def_maps,
+            self.dependencies,
+        )
+    }
+
+    fn get_ancestor_module_reexport(
+        &self,
+        module_def_id: ModuleDefId,
+        visibility: ItemVisibility,
+    ) -> Option<Reexport> {
+        get_ancestor_module_reexport(
+            module_def_id,
+            visibility,
+            self.module_id,
+            self.interner,
+            self.def_maps,
+            self.dependencies,
+        )
+    }
+
     fn includes_span(&self, span: Span) -> bool {
         let byte_range_span = Span::from(self.byte_range.start as u32..self.byte_range.end as u32);
         span.intersects(&byte_range_span)
     }
 }
 
-impl<'a> Visitor for CodeActionFinder<'a> {
+impl Visitor for CodeActionFinder<'_> {
     fn visit_item(&mut self, item: &Item) -> bool {
-        if let ItemKind::Import(..) = &item.kind {
-            if let Some(lsp_location) = to_lsp_location(self.files, self.file, item.span) {
+        if let ItemKind::Import(use_tree, _) = &item.kind {
+            if let Some(lsp_location) = to_lsp_location(self.files, self.file, item.location.span) {
                 self.auto_import_line = (lsp_location.range.end.line + 1) as usize;
             }
+            self.use_segment_positions.add(use_tree);
         }
 
-        self.includes_span(item.span)
+        self.includes_span(item.location.span)
     }
 
     fn visit_parsed_submodule(&mut self, parsed_sub_module: &ParsedSubModule, span: Span) -> bool {
@@ -244,6 +296,36 @@ impl<'a> Visitor for CodeActionFinder<'a> {
 
     fn visit_noir_trait_impl(&mut self, noir_trait_impl: &NoirTraitImpl, span: Span) -> bool {
         self.implement_missing_members(noir_trait_impl, span);
+
+        true
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression, span: Span) -> bool {
+        if !self.includes_span(span) {
+            return false;
+        }
+
+        if call.is_macro_call {
+            self.remove_bang_from_call(call.func.location.span);
+        }
+
+        true
+    }
+
+    fn visit_method_call_expression(
+        &mut self,
+        method_call: &MethodCallExpression,
+        span: Span,
+    ) -> bool {
+        if !self.includes_span(span) {
+            return false;
+        }
+
+        if method_call.is_macro_call {
+            self.remove_bang_from_call(method_call.method_name.span());
+        }
+
+        self.import_trait_in_method_call(method_call);
 
         true
     }

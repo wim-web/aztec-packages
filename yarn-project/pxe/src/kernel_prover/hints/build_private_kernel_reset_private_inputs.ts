@@ -1,20 +1,27 @@
-import { type PrivateExecutionResult, type PrivateKernelSimulateOutput, collectNested } from '@aztec/circuit-types';
 import {
-  type Fr,
-  KeyValidationHint,
   MAX_KEY_VALIDATION_REQUESTS_PER_TX,
   MAX_NOTE_HASHES_PER_TX,
   MAX_NOTE_HASH_READ_REQUESTS_PER_TX,
   MAX_NULLIFIERS_PER_TX,
   MAX_NULLIFIER_READ_REQUESTS_PER_TX,
-  MembershipWitness,
   NULLIFIER_TREE_HEIGHT,
+  VK_TREE_HEIGHT,
+} from '@aztec/constants';
+import { makeTuple } from '@aztec/foundation/array';
+import { padArrayEnd } from '@aztec/foundation/collection';
+import type { Fr } from '@aztec/foundation/fields';
+import { type Tuple, assertLength } from '@aztec/foundation/serialize';
+import { MembershipWitness } from '@aztec/foundation/trees';
+import { privateKernelResetDimensionsConfig } from '@aztec/noir-protocol-circuits-types/client';
+import {
+  KeyValidationHint,
   type PrivateCircuitPublicInputs,
   type PrivateKernelCircuitPublicInputs,
   PrivateKernelData,
   PrivateKernelResetCircuitPrivateInputs,
   PrivateKernelResetDimensions,
   PrivateKernelResetHints,
+  type PrivateKernelSimulateOutput,
   type ReadRequest,
   ReadRequestResetStates,
   ReadRequestState,
@@ -23,7 +30,6 @@ import {
   ScopedNullifier,
   ScopedReadRequest,
   TransientDataIndexHint,
-  VK_TREE_HEIGHT,
   buildNoteHashReadRequestHintsFromResetStates,
   buildNullifierReadRequestHintsFromResetStates,
   buildTransientDataHints,
@@ -33,26 +39,19 @@ import {
   getNoteHashReadRequestResetStates,
   getNullifierReadRequestResetStates,
   privateKernelResetDimensionNames,
-} from '@aztec/circuits.js';
-import { makeTuple } from '@aztec/foundation/array';
-import { padArrayEnd } from '@aztec/foundation/collection';
-import { type Tuple, assertLength } from '@aztec/foundation/serialize';
-import { privateKernelResetDimensionsConfig } from '@aztec/noir-protocol-circuits-types';
+} from '@aztec/stdlib/kernel';
+import { type PrivateCallExecutionResult, collectNested } from '@aztec/stdlib/tx';
 
-import { type ProvingDataOracle } from '../proving_data_oracle.js';
+import type { ProvingDataOracle } from '../proving_data_oracle.js';
 
 function collectNestedReadRequests(
-  executionStack: PrivateExecutionResult[],
-  extractReadRequests: (execution: PrivateExecutionResult) => ReadRequest[],
+  executionStack: PrivateCallExecutionResult[],
+  extractReadRequests: (execution: PrivateCallExecutionResult) => ReadRequest[],
 ): ScopedReadRequest[] {
   return collectNested(executionStack, executionResult => {
     const nonEmptyReadRequests = getNonEmptyItems(extractReadRequests(executionResult));
     return nonEmptyReadRequests.map(
-      readRequest =>
-        new ScopedReadRequest(
-          readRequest,
-          executionResult.callStackItem.publicInputs.callContext.storageContractAddress,
-        ),
+      readRequest => new ScopedReadRequest(readRequest, executionResult.publicInputs.callContext.contractAddress),
     );
   });
 }
@@ -61,7 +60,7 @@ function getNullifierMembershipWitnessResolver(oracle: ProvingDataOracle) {
   return async (nullifier: Fr) => {
     const res = await oracle.getNullifierMembershipWitness(nullifier);
     if (!res) {
-      throw new Error(`Cannot find the leaf for nullifier ${nullifier.toBigInt()}.`);
+      throw new Error(`Cannot find the leaf for nullifier ${nullifier}.`);
     }
 
     const { index, siblingPath, leafPreimage } = res;
@@ -105,7 +104,7 @@ export class PrivateKernelResetPrivateInputsBuilder {
 
   constructor(
     private previousKernelOutput: PrivateKernelSimulateOutput<PrivateKernelCircuitPublicInputs>,
-    private executionStack: PrivateExecutionResult[],
+    private executionStack: PrivateCallExecutionResult[],
     private noteHashNullifierCounterMap: Map<number, number>,
     private validationRequestsSplitCounter: number,
   ) {
@@ -117,7 +116,7 @@ export class PrivateKernelResetPrivateInputsBuilder {
       MAX_NULLIFIERS_PER_TX,
       () => new TransientDataIndexHint(MAX_NULLIFIERS_PER_TX, MAX_NOTE_HASHES_PER_TX),
     );
-    this.nextIteration = executionStack[this.executionStack.length - 1]?.callStackItem.publicInputs;
+    this.nextIteration = executionStack[this.executionStack.length - 1]?.publicInputs;
   }
 
   needsReset(): boolean {
@@ -135,7 +134,7 @@ export class PrivateKernelResetPrivateInputsBuilder {
     } else {
       // Siloing is only needed after processing all iterations.
       fns.push(
-        ...[() => this.needsSiloNoteHashes(), () => this.needsSiloNullifiers(), () => this.needsSiloLogHashes()],
+        ...[() => this.needsSiloNoteHashes(), () => this.needsSiloNullifiers(), () => this.needsSiloPrivateLogs()],
       );
       // If there's no next iteration, reset is needed when any of the dimension has non empty data.
       // All the fns should to be executed so that data in all dimensions will be reset.
@@ -244,10 +243,9 @@ export class PrivateKernelResetPrivateInputsBuilder {
     }
 
     const futureNoteHashes = collectNested(this.executionStack, executionResult => {
-      const nonEmptyNoteHashes = getNonEmptyItems(executionResult.callStackItem.publicInputs.noteHashes);
+      const nonEmptyNoteHashes = getNonEmptyItems(executionResult.publicInputs.noteHashes);
       return nonEmptyNoteHashes.map(
-        noteHash =>
-          new ScopedNoteHash(noteHash, executionResult.callStackItem.publicInputs.callContext.storageContractAddress),
+        noteHash => new ScopedNoteHash(noteHash, executionResult.publicInputs.callContext.contractAddress),
       );
     });
 
@@ -297,10 +295,9 @@ export class PrivateKernelResetPrivateInputsBuilder {
     }
 
     const futureNullifiers = collectNested(this.executionStack, executionResult => {
-      const nonEmptyNullifiers = getNonEmptyItems(executionResult.callStackItem.publicInputs.nullifiers);
+      const nonEmptyNullifiers = getNonEmptyItems(executionResult.publicInputs.nullifiers);
       return nonEmptyNullifiers.map(
-        nullifier =>
-          new ScopedNullifier(nullifier, executionResult.callStackItem.publicInputs.callContext.storageContractAddress),
+        nullifier => new ScopedNullifier(nullifier, executionResult.publicInputs.callContext.contractAddress),
       );
     });
 
@@ -376,11 +373,11 @@ export class PrivateKernelResetPrivateInputsBuilder {
 
     const futureNoteHashReads = collectNestedReadRequests(
       this.executionStack,
-      executionResult => executionResult.callStackItem.publicInputs.noteHashReadRequests,
+      executionResult => executionResult.publicInputs.noteHashReadRequests,
     );
     const futureNullifierReads = collectNestedReadRequests(
       this.executionStack,
-      executionResult => executionResult.callStackItem.publicInputs.nullifierReadRequests,
+      executionResult => executionResult.publicInputs.nullifierReadRequests,
     );
     if (this.nextIteration) {
       // If it's not the final reset, only one dimension will be reset at a time.
@@ -430,7 +427,7 @@ export class PrivateKernelResetPrivateInputsBuilder {
       throw new Error('`needsResetTransientData` must be run before `needsSiloNoteHashes`.');
     }
 
-    const numNoteHashes = this.previousKernel.end.noteHashes.filter(n => !n.contractAddress.isEmpty()).length;
+    const numNoteHashes = this.previousKernel.end.noteHashes.filter(n => !n.contractAddress.isZero()).length;
     const numToSilo = Math.max(0, numNoteHashes - this.numTransientData);
     this.requestedDimensions.NOTE_HASH_SILOING_AMOUNT = numToSilo;
 
@@ -442,7 +439,7 @@ export class PrivateKernelResetPrivateInputsBuilder {
       throw new Error('`needsResetTransientData` must be run before `needsSiloNullifiers`.');
     }
 
-    const numNullifiers = this.previousKernel.end.nullifiers.filter(n => !n.contractAddress.isEmpty()).length;
+    const numNullifiers = this.previousKernel.end.nullifiers.filter(n => !n.contractAddress.isZero()).length;
     const numToSilo = Math.max(0, numNullifiers - this.numTransientData);
     // Include the first nullifier if there's something to silo.
     // The reset circuit checks that capped_size must be greater than or equal to all non-empty nullifiers.
@@ -453,14 +450,22 @@ export class PrivateKernelResetPrivateInputsBuilder {
     return numToSilo > 0;
   }
 
-  private needsSiloLogHashes() {
+  private needsSiloPrivateLogs() {
     if (this.numTransientData === undefined) {
-      throw new Error('`needsResetTransientData` must be run before `needsSiloLogHashes`.');
+      throw new Error('`needsResetTransientData` must be run before `needsSiloPrivateLogs`.');
     }
 
-    const numLogs = this.previousKernel.end.encryptedLogsHashes.filter(l => !l.logHash.randomness.isZero()).length;
-    const numToSilo = Math.max(0, numLogs - this.numTransientData);
-    this.requestedDimensions.ENCRYPTED_LOG_SILOING_AMOUNT = numToSilo;
+    const privateLogs = this.previousKernel.end.privateLogs;
+    const numLogs = privateLogs.filter(l => !l.contractAddress.isZero()).length;
+
+    const noteHashes = this.previousKernel.end.noteHashes;
+    const squashedNoteHashCounters = this.transientDataIndexHints
+      .filter(h => h.noteHashIndex < noteHashes.length)
+      .map(h => noteHashes[h.noteHashIndex].counter);
+    const numSquashedLogs = privateLogs.filter(l => squashedNoteHashCounters.includes(l.inner.noteHashCounter)).length;
+
+    const numToSilo = numLogs - numSquashedLogs;
+    this.requestedDimensions.PRIVATE_LOG_SILOING_AMOUNT = numToSilo;
 
     return numToSilo > 0;
   }

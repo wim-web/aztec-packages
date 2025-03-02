@@ -1,18 +1,18 @@
-use lsp_types::{Position, Range, TextEdit};
+use lsp_types::TextEdit;
 use noirc_errors::Location;
-use noirc_frontend::{
-    ast::{Ident, Path},
-    hir::def_map::ModuleDefId,
-};
+use noirc_frontend::ast::{Ident, Path};
 
 use crate::{
     byte_span_to_range,
-    modules::{relative_module_full_path, relative_module_id_path},
+    modules::module_def_id_relative_path,
+    use_segment_positions::{
+        use_completion_item_additional_text_edits, UseCompletionItemAdditionTextEditsRequest,
+    },
 };
 
 use super::CodeActionFinder;
 
-impl<'a> CodeActionFinder<'a> {
+impl CodeActionFinder<'_> {
     pub(super) fn import_or_qualify(&mut self, path: &Path) {
         if path.segments.len() != 1 {
             return;
@@ -37,74 +37,65 @@ impl<'a> CodeActionFinder<'a> {
                 continue;
             }
 
-            for (module_def_id, visibility, defining_module) in entries {
-                let module_full_path = if let Some(defining_module) = defining_module {
-                    relative_module_id_path(
-                        *defining_module,
-                        &self.module_id,
-                        current_module_parent_id,
-                        self.interner,
-                    )
-                } else {
-                    let Some(module_full_path) = relative_module_full_path(
-                        *module_def_id,
-                        *visibility,
-                        self.module_id,
-                        current_module_parent_id,
-                        self.interner,
-                        self.def_maps,
-                    ) else {
+            for entry in entries {
+                let module_def_id = entry.module_def_id;
+                let visibility = entry.visibility;
+                let mut defining_module = entry.defining_module.as_ref().cloned();
+
+                // If the item is offered via a re-export of it's parent module, this holds the name of the reexport.
+                let mut intermediate_name = None;
+
+                let is_visible =
+                    self.module_def_id_is_visible(module_def_id, visibility, defining_module);
+                if !is_visible {
+                    if let Some(reexport) =
+                        self.get_ancestor_module_reexport(module_def_id, visibility)
+                    {
+                        defining_module = Some(reexport.module_id);
+                        intermediate_name = Some(reexport.name);
+                    } else {
                         continue;
-                    };
-                    module_full_path
-                };
+                    }
+                }
 
-                let full_path = if defining_module.is_some()
-                    || !matches!(module_def_id, ModuleDefId::ModuleId(..))
-                {
-                    format!("{}::{}", module_full_path, name)
-                } else {
-                    module_full_path.clone()
-                };
-
-                let qualify_prefix = if let ModuleDefId::ModuleId(..) = module_def_id {
-                    let mut segments: Vec<_> = module_full_path.split("::").collect();
-                    segments.pop();
-                    segments.join("::")
-                } else {
-                    module_full_path
+                let Some(full_path) = module_def_id_relative_path(
+                    module_def_id,
+                    name,
+                    self.module_id,
+                    current_module_parent_id,
+                    defining_module,
+                    &intermediate_name,
+                    self.interner,
+                ) else {
+                    continue;
                 };
 
                 self.push_import_code_action(&full_path);
-                self.push_qualify_code_action(ident, &qualify_prefix, &full_path);
+                self.push_qualify_code_action(ident, &full_path);
             }
         }
     }
 
     fn push_import_code_action(&mut self, full_path: &str) {
-        let line = self.auto_import_line as u32;
-        let character = (self.nesting * 4) as u32;
-        let indent = " ".repeat(self.nesting * 4);
-        let mut newlines = "\n";
-
-        // If the line we are inserting into is not an empty line, insert an extra line to make some room
-        if let Some(line_text) = self.lines.get(line as usize) {
-            if !line_text.trim().is_empty() {
-                newlines = "\n\n";
-            }
-        }
-
         let title = format!("Import {}", full_path);
-        let text_edit = TextEdit {
-            range: Range { start: Position { line, character }, end: Position { line, character } },
-            new_text: format!("use {};{}{}", full_path, newlines, indent),
-        };
 
-        let code_action = self.new_quick_fix(title, text_edit);
+        let text_edits = use_completion_item_additional_text_edits(
+            UseCompletionItemAdditionTextEditsRequest {
+                full_path,
+                files: self.files,
+                file: self.file,
+                lines: &self.lines,
+                nesting: self.nesting,
+                auto_import_line: self.auto_import_line,
+            },
+            &self.use_segment_positions,
+        );
+
+        let code_action = self.new_quick_fix_multiple_edits(title, text_edits);
         self.code_actions.push(code_action);
     }
 
-    fn push_qualify_code_action(&mut self, ident: &Ident, prefix: &str, full_path: &str) {
+    fn push_qualify_code_action(&mut self, ident: &Ident, full_path: &str) {
         let Some(range) = byte_span_to_range(
             self.files,
             self.file,
@@ -112,6 +103,10 @@ impl<'a> CodeActionFinder<'a> {
         ) else {
             return;
         };
+
+        let mut prefix = full_path.split("::").collect::<Vec<_>>();
+        prefix.pop();
+        let prefix = prefix.join("::");
 
         let title = format!("Qualify as {}", full_path);
         let text_edit = TextEdit { range, new_text: format!("{}::", prefix) };
@@ -133,7 +128,7 @@ mod tests {
 
         let src = r#"
         mod foo {
-            mod bar {
+            pub mod bar {
                 pub struct SomeTypeInBar {}
             }
         }
@@ -143,7 +138,7 @@ mod tests {
 
         let expected = r#"
         mod foo {
-            mod bar {
+            pub mod bar {
                 pub struct SomeTypeInBar {}
             }
         }
@@ -159,7 +154,7 @@ mod tests {
         let title = "Import foo::bar::SomeTypeInBar";
 
         let src = r#"mod foo {
-    mod bar {
+    pub mod bar {
         pub struct SomeTypeInBar {}
     }
 }
@@ -169,7 +164,32 @@ fn foo(x: SomeType>|<InBar) {}"#;
         let expected = r#"use foo::bar::SomeTypeInBar;
 
 mod foo {
-    mod bar {
+    pub mod bar {
+        pub struct SomeTypeInBar {}
+    }
+}
+
+fn foo(x: SomeTypeInBar) {}"#;
+
+        assert_code_action(title, src, expected).await;
+    }
+
+    #[test]
+    async fn test_import_code_action_for_struct_at_beginning_of_name() {
+        let title = "Import foo::bar::SomeTypeInBar";
+
+        let src = r#"mod foo {
+    pub mod bar {
+        pub struct SomeTypeInBar {}
+    }
+}
+
+fn foo(x: >|<SomeTypeInBar) {}"#;
+
+        let expected = r#"use foo::bar::SomeTypeInBar;
+
+mod foo {
+    pub mod bar {
         pub struct SomeTypeInBar {}
     }
 }
@@ -185,7 +205,7 @@ fn foo(x: SomeTypeInBar) {}"#;
 
         let src = r#"
         mod foo {
-            mod bar {
+            pub mod bar {
                 pub mod some_module_in_bar {}
             }
         }
@@ -197,7 +217,7 @@ fn foo(x: SomeTypeInBar) {}"#;
 
         let expected = r#"
         mod foo {
-            mod bar {
+            pub mod bar {
                 pub mod some_module_in_bar {}
             }
         }
@@ -215,7 +235,7 @@ fn foo(x: SomeTypeInBar) {}"#;
         let title = "Import foo::bar::some_module_in_bar";
 
         let src = r#"mod foo {
-    mod bar {
+    pub mod bar {
         pub(crate) mod some_module_in_bar {}
     }
 }
@@ -227,13 +247,112 @@ fn main() {
         let expected = r#"use foo::bar::some_module_in_bar;
 
 mod foo {
-    mod bar {
+    pub mod bar {
         pub(crate) mod some_module_in_bar {}
     }
 }
 
 fn main() {
     some_module_in_bar
+}"#;
+
+        assert_code_action(title, src, expected).await;
+    }
+
+    #[test]
+    async fn test_import_code_action_for_struct_inserts_into_existing_use() {
+        let title = "Import foo::bar::SomeTypeInBar";
+
+        let src = r#"use foo::bar::SomeOtherType;
+
+mod foo {
+    pub mod bar {
+        pub struct SomeTypeInBar {}
+    }
+}
+
+fn foo(x: SomeType>|<InBar) {}"#;
+
+        let expected = r#"use foo::bar::{SomeOtherType, SomeTypeInBar};
+
+mod foo {
+    pub mod bar {
+        pub struct SomeTypeInBar {}
+    }
+}
+
+fn foo(x: SomeTypeInBar) {}"#;
+
+        assert_code_action(title, src, expected).await;
+    }
+
+    #[test]
+    async fn test_import_via_reexport() {
+        let title = "Import aztec::protocol_types::SomeStruct";
+
+        let src = r#"mod aztec {
+    mod deps {
+        pub mod protocol_types {
+            pub struct SomeStruct {}
+        }
+    }
+
+    pub use deps::protocol_types;
+}
+
+fn main() {
+    SomeStr>|<uct
+}"#;
+
+        let expected = r#"use aztec::protocol_types::SomeStruct;
+
+mod aztec {
+    mod deps {
+        pub mod protocol_types {
+            pub struct SomeStruct {}
+        }
+    }
+
+    pub use deps::protocol_types;
+}
+
+fn main() {
+    SomeStruct
+}"#;
+
+        assert_code_action(title, src, expected).await;
+    }
+
+    #[test]
+    async fn test_qualify_via_reexport() {
+        let title = "Qualify as aztec::protocol_types::SomeStruct";
+
+        let src = r#"mod aztec {
+    mod deps {
+        pub mod protocol_types {
+            pub struct SomeStruct {}
+        }
+    }
+
+    pub use deps::protocol_types;
+}
+
+fn main() {
+    SomeStr>|<uct
+}"#;
+
+        let expected = r#"mod aztec {
+    mod deps {
+        pub mod protocol_types {
+            pub struct SomeStruct {}
+        }
+    }
+
+    pub use deps::protocol_types;
+}
+
+fn main() {
+    aztec::protocol_types::SomeStruct
 }"#;
 
         assert_code_action(title, src, expected).await;

@@ -23,10 +23,18 @@ impl MyDefault for Foo {
 
 trait F {
     fn f1(self) -> Field;
-    fn f2(_self: Self) -> Field { 2 }
-    fn f3(_self: Self) -> Field { 3 }
-    fn f4(_self: Self) -> Field { 4 }
-    fn f5(_self: Self) -> Field { 5 }
+    fn f2(_self: Self) -> Field {
+        2
+    }
+    fn f3(_self: Self) -> Field {
+        3
+    }
+    fn f4(_self: Self) -> Field {
+        4
+    }
+    fn f5(_self: Self) -> Field {
+        5
+    }
 }
 
 struct Bar {}
@@ -72,4 +80,3 @@ fn main(x: Field) {
     assert(bar_mut.f4() == 4, "14");
     assert(bar_mut.f5() == 50, "15");
 }
-

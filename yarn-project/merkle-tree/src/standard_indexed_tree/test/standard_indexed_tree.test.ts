@@ -1,16 +1,16 @@
-import { SiblingPath } from '@aztec/circuit-types';
+import { toBufferBE } from '@aztec/foundation/bigint-buffer';
+import { Fr } from '@aztec/foundation/fields';
+import type { FromBuffer } from '@aztec/foundation/serialize';
+import { SiblingPath } from '@aztec/foundation/trees';
+import type { Hasher } from '@aztec/foundation/trees';
+import type { AztecKVStore } from '@aztec/kv-store';
+import { openTmpStore } from '@aztec/kv-store/lmdb';
 import {
-  Fr,
   NullifierLeaf,
   NullifierLeafPreimage,
   PublicDataTreeLeaf,
   PublicDataTreeLeafPreimage,
-} from '@aztec/circuits.js';
-import { toBufferBE } from '@aztec/foundation/bigint-buffer';
-import { type FromBuffer } from '@aztec/foundation/serialize';
-import { type AztecKVStore } from '@aztec/kv-store';
-import { openTmpStore } from '@aztec/kv-store/utils';
-import { type Hasher } from '@aztec/types/interfaces';
+} from '@aztec/stdlib/trees';
 
 import { INITIAL_LEAF, type MerkleTree, Pedersen, loadTree, newTree } from '../../index.js';
 import { treeTestSuite } from '../../test/test_suite.js';
@@ -508,7 +508,7 @@ describe('StandardIndexedTreeSpecific', () => {
 
     const TREE_HEIGHT = 16; // originally from NULLIFIER_TREE_HEIGHT
     const INITIAL_TREE_SIZE = 8; // originally from INITIAL_NULLIFIER_TREE_SIZE
-    const SUBTREE_HEIGHT = 5; // originally from BaseRollupInputs.NULLIFIER_SUBTREE_HEIGHT
+    const SUBTREE_HEIGHT = 5; // originally from NULLIFIER_SUBTREE_HEIGHT
 
     // Create a depth-3 indexed merkle tree
     const appendTree = await createDb(openTmpStore(), pedersen, 'test', TREE_HEIGHT, INITIAL_TREE_SIZE);

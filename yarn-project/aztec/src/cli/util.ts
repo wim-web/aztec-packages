@@ -1,19 +1,12 @@
-import { type AccountManager, type Fr } from '@aztec/aztec.js';
-import { type L1ContractAddresses, l1ContractsNames } from '@aztec/ethereum';
-import { type ConfigMappingsType } from '@aztec/foundation/config';
-import { EthAddress } from '@aztec/foundation/eth-address';
-import { type ServerList } from '@aztec/foundation/json-rpc/server';
-import { type LogFn } from '@aztec/foundation/log';
-import { type PXEService } from '@aztec/pxe';
+import type { AccountManager, Fr } from '@aztec/aztec.js';
+import type { ConfigMappingsType } from '@aztec/foundation/config';
+import type { LogFn } from '@aztec/foundation/log';
+import type { PXEService } from '@aztec/pxe';
 
 import chalk from 'chalk';
-import { type Command } from 'commander';
+import type { Command } from 'commander';
 
 import { type AztecStartOption, aztecStartOptions } from './aztec_start_options.js';
-
-export interface ServiceStarter<T = any> {
-  (options: T, signalHandlers: (() => Promise<void>)[], logger: LogFn): Promise<ServerList>;
-}
 
 export const installSignalHandlers = (logFn: LogFn, cb?: Array<() => Promise<void>>) => {
   const shutdown = async () => {
@@ -25,7 +18,9 @@ export const installSignalHandlers = (logFn: LogFn, cb?: Array<() => Promise<voi
   };
   process.removeAllListeners('SIGINT');
   process.removeAllListeners('SIGTERM');
+  // eslint-disable-next-line @typescript-eslint/no-misused-promises
   process.once('SIGINT', shutdown);
+  // eslint-disable-next-line @typescript-eslint/no-misused-promises
   process.once('SIGTERM', shutdown);
 };
 
@@ -36,7 +31,7 @@ export const installSignalHandlers = (logFn: LogFn, cb?: Array<() => Promise<voi
  * @returns A string array containing the initial accounts details
  */
 export async function createAccountLogs(
-  accounts: {
+  accountsWithSecretKeys: {
     /**
      * The account object
      */
@@ -50,12 +45,12 @@ export async function createAccountLogs(
 ) {
   const registeredAccounts = await pxe.getRegisteredAccounts();
   const accountLogStrings = [`Initial Accounts:\n\n`];
-  for (const account of accounts) {
-    const completeAddress = account.account.getCompleteAddress();
+  for (const accountWithSecretKey of accountsWithSecretKeys) {
+    const completeAddress = await accountWithSecretKey.account.getCompleteAddress();
     if (registeredAccounts.find(a => a.equals(completeAddress))) {
       accountLogStrings.push(` Address: ${completeAddress.address.toString()}\n`);
       accountLogStrings.push(` Partial Address: ${completeAddress.partialAddress.toString()}\n`);
-      accountLogStrings.push(` Secret Key: ${account.secretKey.toString()}\n`);
+      accountLogStrings.push(` Secret Key: ${accountWithSecretKey.secretKey.toString()}\n`);
       accountLogStrings.push(
         ` Master nullifier public key: ${completeAddress.publicKeys.masterNullifierPublicKey.toString()}\n`,
       );
@@ -174,23 +169,6 @@ export const extractNamespacedOptions = (options: Record<string, any>, namespace
     }
   }
   return namespacedOptions;
-};
-
-/**
- * Extracts L1 contract addresses from a key-value map.
- * @param options - Key-value map of options.
- * @returns L1 contract addresses.
- */
-export const extractL1ContractAddresses = (options: Record<string, any>): L1ContractAddresses => {
-  const contractAddresses: L1ContractAddresses = l1ContractsNames.reduce((acc, cn) => {
-    const key = cn as keyof L1ContractAddresses;
-    if (options[key]) {
-      return { ...acc, [key]: EthAddress.fromString(options[key]) };
-    }
-    return acc;
-  }, {} as L1ContractAddresses);
-
-  return contractAddresses;
 };
 
 /**

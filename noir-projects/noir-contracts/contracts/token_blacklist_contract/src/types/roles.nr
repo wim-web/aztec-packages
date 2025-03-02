@@ -1,4 +1,4 @@
-use dep::aztec::protocol_types::traits::{FromField, ToField, Serialize, Deserialize};
+use dep::aztec::protocol_types::traits::{Deserialize, Packable, Serialize};
 
 global ADMIN_FLAG: u64 = 1;
 global MINTER_FLAG: u64 = 2;
@@ -10,19 +10,8 @@ pub struct UserFlags {
     is_blacklisted: bool,
 }
 
-impl FromField for UserFlags {
-    fn from_field(value: Field) -> UserFlags {
-        let value: u64 = value as u64;
-        let is_admin = value & ADMIN_FLAG == ADMIN_FLAG;
-        let is_minter = value & MINTER_FLAG == MINTER_FLAG;
-        let is_blacklisted = value & BLACKLIST_FLAG == BLACKLIST_FLAG;
-
-        Self { is_admin, is_minter, is_blacklisted }
-    }
-}
-
-impl ToField for UserFlags {
-    fn to_field(self) -> Field {
+impl Packable<1> for UserFlags {
+    fn pack(self) -> [Field; 1] {
         let mut value: u64 = 0;
 
         if self.is_admin {
@@ -37,7 +26,16 @@ impl ToField for UserFlags {
             value = value | BLACKLIST_FLAG;
         }
 
-        value.to_field()
+        [value.to_field()]
+    }
+
+    fn unpack(fields: [Field; 1]) -> Self {
+        let value: u64 = fields[0] as u64;
+        let is_admin = value & ADMIN_FLAG == ADMIN_FLAG;
+        let is_minter = value & MINTER_FLAG == MINTER_FLAG;
+        let is_blacklisted = value & BLACKLIST_FLAG == BLACKLIST_FLAG;
+
+        Self { is_admin, is_minter, is_blacklisted }
     }
 }
 
@@ -64,16 +62,20 @@ impl Serialize<3> for UserFlags {
 // after having received the serialized value as a return-value
 impl Deserialize<3> for UserFlags {
     fn deserialize(fields: [Field; 3]) -> Self {
-        Self { is_admin: fields[0] as bool, is_minter: fields[1] as bool, is_blacklisted: fields[2] as bool }
+        Self {
+            is_admin: fields[0] as bool,
+            is_minter: fields[1] as bool,
+            is_blacklisted: fields[2] as bool,
+        }
     }
 }
 
 mod test {
     use crate::types::roles::UserFlags;
 
-    fn assert_to_from_field(is_minter: bool, is_admin: bool, is_blacklisted: bool) {
+    fn assert_packable(is_minter: bool, is_admin: bool, is_blacklisted: bool) {
         let flags = UserFlags { is_minter, is_admin, is_blacklisted };
-        let converted = UserFlags::from_field(flags.to_field());
+        let converted = UserFlags::unpack(flags.pack());
 
         assert_eq(converted.is_minter, is_minter);
         assert_eq(converted.is_admin, is_admin);
@@ -82,16 +84,16 @@ mod test {
 
     #[test]
     fn test_to_from_field() {
-        assert_to_from_field(false, false, false);
-        assert_to_from_field(false, false, true);
+        assert_packable(false, false, false);
+        assert_packable(false, false, true);
 
-        assert_to_from_field(false, true, false);
-        assert_to_from_field(false, true, true);
+        assert_packable(false, true, false);
+        assert_packable(false, true, true);
 
-        assert_to_from_field(true, false, false);
-        assert_to_from_field(true, false, true);
+        assert_packable(true, false, false);
+        assert_packable(true, false, true);
 
-        assert_to_from_field(true, true, false);
-        assert_to_from_field(true, true, true);
+        assert_packable(true, true, false);
+        assert_packable(true, true, true);
     }
 }

@@ -1,50 +1,44 @@
-import {
-  type AuthWitness,
-  type EventMetadata,
-  type EventType,
-  type ExtendedNote,
-  type GetUnencryptedLogsResponse,
-  type IncomingNotesFilter,
-  type L2Block,
-  type LogFilter,
-  type OutgoingNotesFilter,
-  type PXE,
-  type PXEInfo,
-  type PrivateExecutionResult,
-  type SiblingPath,
-  type SyncStatus,
-  type Tx,
-  type TxEffect,
-  type TxExecutionRequest,
-  type TxHash,
-  type TxProvingResult,
-  type TxReceipt,
-  type TxSimulationResult,
-  type UniqueNote,
-} from '@aztec/circuit-types';
-import { type NoteProcessorStats } from '@aztec/circuit-types/stats';
-import {
-  type AztecAddress,
-  type CompleteAddress,
-  type ContractClassWithId,
-  type ContractInstanceWithAddress,
-  type Fr,
-  type L1_TO_L2_MSG_TREE_HEIGHT,
-  type NodeInfo,
-  type PartialAddress,
-  type Point,
-} from '@aztec/circuits.js';
-import { type ContractArtifact } from '@aztec/foundation/abi';
+import type { L1_TO_L2_MSG_TREE_HEIGHT } from '@aztec/constants';
+import type { Fr, Point } from '@aztec/foundation/fields';
+import type { SiblingPath } from '@aztec/foundation/trees';
+import type { AbiDecoded, ContractArtifact } from '@aztec/stdlib/abi';
+import type { AuthWitness } from '@aztec/stdlib/auth-witness';
+import type { AztecAddress } from '@aztec/stdlib/aztec-address';
+import type { L2Block } from '@aztec/stdlib/block';
+import type { CompleteAddress, ContractInstanceWithAddress, NodeInfo, PartialAddress } from '@aztec/stdlib/contract';
+import type { GasFees } from '@aztec/stdlib/gas';
+import type {
+  ContractClassMetadata,
+  ContractMetadata,
+  EventMetadataDefinition,
+  GetContractClassLogsResponse,
+  GetPublicLogsResponse,
+  PXE,
+  PXEInfo,
+} from '@aztec/stdlib/interfaces/client';
+import type { LogFilter } from '@aztec/stdlib/logs';
+import type { NotesFilter, UniqueNote } from '@aztec/stdlib/note';
+import type {
+  PrivateExecutionResult,
+  Tx,
+  TxExecutionRequest,
+  TxHash,
+  TxProvingResult,
+  TxReceipt,
+  TxSimulationResult,
+} from '@aztec/stdlib/tx';
 
-import { type Wallet } from '../account/wallet.js';
-import { type ExecutionRequestInit } from '../entrypoint/entrypoint.js';
-import { type IntentAction, type IntentInnerHash } from '../utils/authwit.js';
+import type { Wallet } from '../account/wallet.js';
+import type { ExecutionRequestInit } from '../entrypoint/entrypoint.js';
+import type { IntentAction, IntentInnerHash } from '../utils/authwit.js';
 
 /**
  * A base class for Wallet implementations
  */
 export abstract class BaseWallet implements Wallet {
   constructor(protected readonly pxe: PXE, private scopes?: AztecAddress[]) {}
+
+  abstract isL1ToL2MessageSynced(l1ToL2Message: Fr): Promise<boolean>;
 
   abstract getCompleteAddress(): CompleteAddress;
 
@@ -67,35 +61,23 @@ export abstract class BaseWallet implements Wallet {
   getAddress() {
     return this.getCompleteAddress().address;
   }
-  getContractInstance(address: AztecAddress): Promise<ContractInstanceWithAddress | undefined> {
-    return this.pxe.getContractInstance(address);
-  }
-  getContractClass(id: Fr): Promise<ContractClassWithId | undefined> {
-    return this.pxe.getContractClass(id);
-  }
-  getContractArtifact(id: Fr): Promise<ContractArtifact | undefined> {
-    return this.pxe.getContractArtifact(id);
-  }
-  addCapsule(capsule: Fr[]): Promise<void> {
-    return this.pxe.addCapsule(capsule);
+  storeCapsule(contract: AztecAddress, storageSlot: Fr, capsule: Fr[]): Promise<void> {
+    return this.pxe.storeCapsule(contract, storageSlot, capsule);
   }
   registerAccount(secretKey: Fr, partialAddress: PartialAddress): Promise<CompleteAddress> {
     return this.pxe.registerAccount(secretKey, partialAddress);
   }
-  registerRecipient(account: CompleteAddress): Promise<void> {
-    return this.pxe.registerRecipient(account);
-  }
   getRegisteredAccounts(): Promise<CompleteAddress[]> {
     return this.pxe.getRegisteredAccounts();
   }
-  getRegisteredAccount(address: AztecAddress): Promise<CompleteAddress | undefined> {
-    return this.pxe.getRegisteredAccount(address);
+  registerSender(address: AztecAddress): Promise<AztecAddress> {
+    return this.pxe.registerSender(address);
   }
-  getRecipients(): Promise<CompleteAddress[]> {
-    return this.pxe.getRecipients();
+  getSenders(): Promise<AztecAddress[]> {
+    return this.pxe.getSenders();
   }
-  getRecipient(address: AztecAddress): Promise<CompleteAddress | undefined> {
-    return this.pxe.getRecipient(address);
+  async removeSender(address: AztecAddress): Promise<void> {
+    await this.pxe.removeSender(address);
   }
   registerContract(contract: {
     /** Instance */ instance: ContractInstanceWithAddress;
@@ -105,6 +87,9 @@ export abstract class BaseWallet implements Wallet {
   }
   registerContractClass(artifact: ContractArtifact): Promise<void> {
     return this.pxe.registerContractClass(artifact);
+  }
+  updateContract(contractAddress: AztecAddress, artifact: ContractArtifact): Promise<void> {
+    return this.pxe.updateContract(contractAddress, artifact);
   }
   getContracts(): Promise<AztecAddress[]> {
     return this.pxe.getContracts();
@@ -117,46 +102,53 @@ export abstract class BaseWallet implements Wallet {
     simulatePublic: boolean,
     msgSender?: AztecAddress,
     skipTxValidation?: boolean,
+    skipFeeEnforcement?: boolean,
+    profile?: boolean,
   ): Promise<TxSimulationResult> {
-    return this.pxe.simulateTx(txRequest, simulatePublic, msgSender, skipTxValidation, this.scopes);
+    return this.pxe.simulateTx(
+      txRequest,
+      simulatePublic,
+      msgSender,
+      skipTxValidation,
+      skipFeeEnforcement,
+      profile,
+      this.scopes,
+    );
   }
   sendTx(tx: Tx): Promise<TxHash> {
     return this.pxe.sendTx(tx);
   }
-  getTxEffect(txHash: TxHash): Promise<TxEffect | undefined> {
+  getTxEffect(txHash: TxHash) {
     return this.pxe.getTxEffect(txHash);
   }
   getTxReceipt(txHash: TxHash): Promise<TxReceipt> {
     return this.pxe.getTxReceipt(txHash);
   }
-  getIncomingNotes(filter: IncomingNotesFilter): Promise<UniqueNote[]> {
-    return this.pxe.getIncomingNotes(filter);
-  }
-  getOutgoingNotes(filter: OutgoingNotesFilter): Promise<UniqueNote[]> {
-    return this.pxe.getOutgoingNotes(filter);
+  getNotes(filter: NotesFilter): Promise<UniqueNote[]> {
+    return this.pxe.getNotes(filter);
   }
   getPublicStorageAt(contract: AztecAddress, storageSlot: Fr): Promise<any> {
     return this.pxe.getPublicStorageAt(contract, storageSlot);
   }
-  addNote(note: ExtendedNote): Promise<void> {
-    return this.pxe.addNote(note, this.getAddress());
-  }
-  addNullifiedNote(note: ExtendedNote): Promise<void> {
-    return this.pxe.addNullifiedNote(note);
-  }
   getBlock(number: number): Promise<L2Block | undefined> {
     return this.pxe.getBlock(number);
+  }
+  getCurrentBaseFees(): Promise<GasFees> {
+    return this.pxe.getCurrentBaseFees();
   }
   simulateUnconstrained(
     functionName: string,
     args: any[],
     to: AztecAddress,
     from?: AztecAddress | undefined,
-  ): Promise<any> {
+  ): Promise<AbiDecoded> {
     return this.pxe.simulateUnconstrained(functionName, args, to, from);
   }
-  getUnencryptedLogs(filter: LogFilter): Promise<GetUnencryptedLogsResponse> {
-    return this.pxe.getUnencryptedLogs(filter);
+  getPublicLogs(filter: LogFilter): Promise<GetPublicLogsResponse> {
+    return this.pxe.getPublicLogs(filter);
+  }
+  getContractClassLogs(filter: LogFilter): Promise<GetContractClassLogsResponse> {
+    return this.pxe.getContractClassLogs(filter);
   }
   getBlockNumber(): Promise<number> {
     return this.pxe.getBlockNumber();
@@ -167,47 +159,31 @@ export abstract class BaseWallet implements Wallet {
   getNodeInfo(): Promise<NodeInfo> {
     return this.pxe.getNodeInfo();
   }
-  isGlobalStateSynchronized() {
-    return this.pxe.isGlobalStateSynchronized();
-  }
-  isAccountStateSynchronized(account: AztecAddress) {
-    return this.pxe.isAccountStateSynchronized(account);
-  }
-  getSyncStatus(): Promise<SyncStatus> {
-    return this.pxe.getSyncStatus();
-  }
-  getSyncStats(): Promise<{ [key: string]: NoteProcessorStats }> {
-    return this.pxe.getSyncStats();
-  }
   addAuthWitness(authWitness: AuthWitness) {
     return this.pxe.addAuthWitness(authWitness);
   }
   getAuthWitness(messageHash: Fr) {
     return this.pxe.getAuthWitness(messageHash);
   }
-  isContractClassPubliclyRegistered(id: Fr): Promise<boolean> {
-    return this.pxe.isContractClassPubliclyRegistered(id);
-  }
-  isContractPubliclyDeployed(address: AztecAddress): Promise<boolean> {
-    return this.pxe.isContractPubliclyDeployed(address);
-  }
-  isContractInitialized(address: AztecAddress): Promise<boolean> {
-    return this.pxe.isContractInitialized(address);
-  }
   getPXEInfo(): Promise<PXEInfo> {
     return this.pxe.getPXEInfo();
   }
-  getEvents<T>(
-    type: EventType,
-    eventMetadata: EventMetadata<T>,
+  getContractClassMetadata(id: Fr, includeArtifact: boolean = false): Promise<ContractClassMetadata> {
+    return this.pxe.getContractClassMetadata(id, includeArtifact);
+  }
+  getContractMetadata(address: AztecAddress): Promise<ContractMetadata> {
+    return this.pxe.getContractMetadata(address);
+  }
+  getPrivateEvents<T>(
+    event: EventMetadataDefinition,
     from: number,
     limit: number,
-    vpks: Point[] = [
-      this.getCompleteAddress().publicKeys.masterIncomingViewingPublicKey,
-      this.getCompleteAddress().publicKeys.masterOutgoingViewingPublicKey,
-    ],
-  ) {
-    return this.pxe.getEvents(type, eventMetadata, from, limit, vpks);
+    vpks: Point[] = [this.getCompleteAddress().publicKeys.masterIncomingViewingPublicKey],
+  ): Promise<T[]> {
+    return this.pxe.getPrivateEvents(event, from, limit, vpks);
+  }
+  getPublicEvents<T>(event: EventMetadataDefinition, from: number, limit: number): Promise<T[]> {
+    return this.pxe.getPublicEvents(event, from, limit);
   }
   public getL1ToL2MembershipWitness(
     contractAddress: AztecAddress,
@@ -215,5 +191,8 @@ export abstract class BaseWallet implements Wallet {
     secret: Fr,
   ): Promise<[bigint, SiblingPath<typeof L1_TO_L2_MSG_TREE_HEIGHT>]> {
     return this.pxe.getL1ToL2MembershipWitness(contractAddress, messageHash, secret);
+  }
+  getL2ToL1MembershipWitness(blockNumber: number, l2Tol1Message: Fr): Promise<[bigint, SiblingPath<number>]> {
+    return this.pxe.getL2ToL1MembershipWitness(blockNumber, l2Tol1Message);
   }
 }

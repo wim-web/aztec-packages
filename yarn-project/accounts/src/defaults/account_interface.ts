@@ -1,15 +1,20 @@
-import { type AccountInterface, type AuthWitnessProvider } from '@aztec/aztec.js/account';
-import { type EntrypointInterface, type ExecutionRequestInit } from '@aztec/aztec.js/entrypoint';
-import { type AuthWitness, type TxExecutionRequest } from '@aztec/circuit-types';
-import { type AztecAddress, type CompleteAddress, Fr, type NodeInfo } from '@aztec/circuits.js';
+import type { AccountInterface, AuthWitnessProvider } from '@aztec/aztec.js/account';
+import type { EntrypointInterface, ExecutionRequestInit } from '@aztec/aztec.js/entrypoint';
 import { DefaultAccountEntrypoint } from '@aztec/entrypoints/account';
+import { Fr } from '@aztec/foundation/fields';
+import type { AuthWitness } from '@aztec/stdlib/auth-witness';
+import type { AztecAddress } from '@aztec/stdlib/aztec-address';
+import { CompleteAddress } from '@aztec/stdlib/contract';
+import type { NodeInfo } from '@aztec/stdlib/contract';
+import type { TxExecutionRequest } from '@aztec/stdlib/tx';
 
 /**
  * Default implementation for an account interface. Requires that the account uses the default
  * entrypoint signature, which accept an AppPayload and a FeePayload as defined in noir-libs/aztec-noir/src/entrypoint module
  */
 export class DefaultAccountInterface implements AccountInterface {
-  private entrypoint: EntrypointInterface;
+  protected entrypoint: EntrypointInterface;
+
   private chainId: Fr;
   private version: Fr;
 

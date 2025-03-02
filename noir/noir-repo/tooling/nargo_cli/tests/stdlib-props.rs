@@ -1,10 +1,8 @@
 use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
-use acvm::{acir::native_types::WitnessStack, FieldElement};
-use nargo::{
-    ops::{execute_program, DefaultForeignCallExecutor},
-    parse_all,
-};
+use acvm::{acir::native_types::WitnessStack, AcirField, FieldElement};
+use iter_extended::vecmap;
+use nargo::{foreign_calls::DefaultForeignCallBuilder, ops::execute_program, parse_all};
 use noirc_abi::input_parser::InputValue;
 use noirc_driver::{
     compile_main, file_manager_with_stdlib, prepare_crate, CompilationResult, CompileOptions,
@@ -63,6 +61,7 @@ fn prepare_and_compile_snippet(
 ) -> CompilationResult<CompiledProgram> {
     let (mut context, root_crate_id) = prepare_snippet(source);
     let options = CompileOptions { force_brillig, ..Default::default() };
+    // TODO: Run nargo::ops::transform_program?
     compile_main(&mut context, root_crate_id, &options, None)
 }
 
@@ -76,12 +75,12 @@ fn run_snippet_proptest(
 ) {
     let program = match prepare_and_compile_snippet(source.clone(), force_brillig) {
         Ok((program, _)) => program,
-        Err(e) => panic!("failed to compile program:\n{source}\n{e:?}"),
+        Err(e) => panic!("failed to compile program; brillig = {force_brillig}:\n{source}\n{e:?}"),
     };
 
-    let blackbox_solver = bn254_blackbox_solver::Bn254BlackBoxSolver;
-    let foreign_call_executor =
-        RefCell::new(DefaultForeignCallExecutor::new(false, None, None, None));
+    let pedandic_solving = true;
+    let blackbox_solver = bn254_blackbox_solver::Bn254BlackBoxSolver(pedandic_solving);
+    let foreign_call_executor = RefCell::new(DefaultForeignCallBuilder::default().build());
 
     // Generate multiple input/output
     proptest!(ProptestConfig::with_cases(100), |(io in strategy)| {
@@ -201,7 +200,7 @@ fn fuzz_keccak256_equivalence() {
                 }}"
             )
         },
-        |data| sha3::Keccak256::digest(data).try_into().unwrap(),
+        |data| sha3::Keccak256::digest(data).into(),
     );
 }
 
@@ -218,7 +217,7 @@ fn fuzz_keccak256_equivalence_over_135() {
                 }}"
             )
         },
-        |data| sha3::Keccak256::digest(data).try_into().unwrap(),
+        |data| sha3::Keccak256::digest(data).into(),
     );
 }
 
@@ -234,7 +233,7 @@ fn fuzz_sha256_equivalence() {
                 }}"
             )
         },
-        |data| sha2::Sha256::digest(data).try_into().unwrap(),
+        |data| sha2::Sha256::digest(data).into(),
     );
 }
 
@@ -250,12 +249,99 @@ fn fuzz_sha512_equivalence() {
                 }}"
             )
         },
-        |data| sha2::Sha512::digest(data).try_into().unwrap(),
+        |data| sha2::Sha512::digest(data).into(),
     );
+}
+
+#[test]
+fn fuzz_poseidon2_equivalence() {
+    use bn254_blackbox_solver::poseidon_hash;
+
+    // Test empty, small, then around the RATE value, then bigger inputs.
+    for max_len in [0, 1, 3, 4, 100] {
+        let source = format!(
+            "fn main(input: [Field; {max_len}], message_size: u32) -> pub Field {{
+                std::hash::poseidon2::Poseidon2::hash(input, message_size)
+            }}"
+        );
+
+        let strategy = (0..=max_len)
+            .prop_flat_map(field_vec_strategy)
+            .prop_map(move |mut msg| {
+                let output = poseidon_hash(&msg, msg.len() < max_len).expect("failed to hash");
+
+                // The input has to be padded to the maximum length.
+                let msg_size = msg.len();
+                msg.resize(max_len, FieldElement::from(0u64));
+
+                let inputs = vec![
+                    ("input", InputValue::Vec(vecmap(msg, InputValue::Field))),
+                    ("message_size", InputValue::Field(FieldElement::from(msg_size))),
+                ];
+
+                SnippetInputOutput::new(inputs, InputValue::Field(output))
+                    .with_description(format!("max_len = {max_len}"))
+            })
+            .boxed();
+
+        run_snippet_proptest(source.clone(), false, strategy);
+    }
+}
+
+#[test]
+fn fuzz_poseidon_equivalence() {
+    use ark_ff_v04::{BigInteger, PrimeField};
+    use light_poseidon::{Poseidon, PoseidonHasher};
+
+    let poseidon_hash = |inputs: &[FieldElement]| {
+        let mut poseidon = Poseidon::<ark_bn254_v04::Fr>::new_circom(inputs.len()).unwrap();
+        let frs: Vec<ark_bn254_v04::Fr> = inputs
+            .iter()
+            .map(|f| ark_bn254_v04::Fr::from_be_bytes_mod_order(&f.to_be_bytes()))
+            .collect::<Vec<_>>();
+        let hash = poseidon.hash(&frs).expect("failed to hash");
+        FieldElement::from_be_bytes_reduce(&hash.into_bigint().to_bytes_be())
+    };
+
+    // Noir has hashes up to length 16, but the reference library won't work with more than 12.
+    for len in 1..light_poseidon::MAX_X5_LEN {
+        let source = format!(
+            "fn main(input: [Field; {len}]) -> pub Field {{
+                let h1 = std::hash::poseidon::bn254::hash_{len}(input);
+                let h2 = {{
+                    let mut hasher = std::hash::poseidon::PoseidonHasher::default();
+                    input.hash(&mut hasher);
+                    hasher.finish()
+                }};
+                assert_eq(h1, h2);
+                h1
+            }}"
+        );
+
+        let strategy = field_vec_strategy(len)
+            .prop_map(move |msg| {
+                let output = poseidon_hash(&msg);
+                let inputs = vec![("input", InputValue::Vec(vecmap(msg, InputValue::Field)))];
+
+                SnippetInputOutput::new(inputs, InputValue::Field(output))
+                    .with_description(format!("len = {len}"))
+            })
+            .boxed();
+
+        run_snippet_proptest(source.clone(), false, strategy);
+    }
 }
 
 fn bytes_input(bytes: &[u8]) -> InputValue {
     InputValue::Vec(
         bytes.iter().map(|b| InputValue::Field(FieldElement::from(*b as u32))).collect(),
     )
+}
+
+fn field_vec_strategy(len: usize) -> impl Strategy<Value = Vec<FieldElement>> {
+    // Generate Field elements from random 32 byte vectors.
+    let field = prop::collection::vec(any::<u8>(), 32)
+        .prop_map(|bytes| FieldElement::from_be_bytes_reduce(&bytes));
+
+    prop::collection::vec(field, len)
 }

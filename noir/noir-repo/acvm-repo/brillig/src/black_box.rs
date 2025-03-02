@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// These opcodes provide an equivalent of ACIR blackbox functions.
 /// They are implemented as native functions in the VM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum BlackBoxOp {
     /// Encrypts a message using AES128.
     AES128Encrypt {
@@ -24,7 +24,7 @@ pub enum BlackBoxOp {
     },
     /// Keccak Permutation function of 1600 width
     Keccakf1600 {
-        message: HeapVector,
+        input: HeapArray,
         output: HeapArray,
     },
     /// Verifies a ECDSA signature over the secp256k1 curve.
@@ -43,26 +43,7 @@ pub enum BlackBoxOp {
         signature: HeapArray,
         result: MemoryAddress,
     },
-    /// Verifies a Schnorr signature over a curve which is "pairing friendly" with the curve on which the Brillig bytecode is defined.
-    SchnorrVerify {
-        public_key_x: MemoryAddress,
-        public_key_y: MemoryAddress,
-        message: HeapVector,
-        signature: HeapVector,
-        result: MemoryAddress,
-    },
-    /// Will be deprecated
-    PedersenCommitment {
-        inputs: HeapVector,
-        domain_separator: MemoryAddress,
-        output: HeapArray,
-    },
-    /// Will be deprecated
-    PedersenHash {
-        inputs: HeapVector,
-        domain_separator: MemoryAddress,
-        output: MemoryAddress,
-    },
+
     /// Performs multi scalar multiplication over the embedded curve.
     MultiScalarMul {
         points: HeapVector,
@@ -114,14 +95,15 @@ pub enum BlackBoxOp {
         len: MemoryAddress,
     },
     Sha256Compression {
-        input: HeapVector,
-        hash_values: HeapVector,
+        input: HeapArray,
+        hash_values: HeapArray,
         output: HeapArray,
     },
     ToRadix {
         input: MemoryAddress,
         radix: MemoryAddress,
-        output: HeapArray,
-        output_bits: bool,
+        output_pointer: MemoryAddress,
+        num_limbs: MemoryAddress,
+        output_bits: MemoryAddress,
     },
 }

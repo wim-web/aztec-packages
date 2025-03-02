@@ -1,17 +1,18 @@
-import { type AztecAddress, CompleteAddress } from '@aztec/circuits.js';
-import { type AztecKVStore, type AztecMap } from '@aztec/kv-store';
+import type { AztecAsyncKVStore, AztecAsyncMap } from '@aztec/kv-store';
 import { KVPxeDatabase } from '@aztec/pxe';
+import type { AztecAddress } from '@aztec/stdlib/aztec-address';
+import { CompleteAddress } from '@aztec/stdlib/contract';
 
 export class TXEDatabase extends KVPxeDatabase {
-  #accounts: AztecMap<string, Buffer>;
+  #accounts: AztecAsyncMap<string, Buffer>;
 
-  constructor(db: AztecKVStore) {
+  constructor(db: AztecAsyncKVStore) {
     super(db);
     this.#accounts = db.openMap('accounts');
   }
 
-  getAccount(key: AztecAddress) {
-    const completeAddress = this.#accounts.get(key.toString());
+  async getAccount(key: AztecAddress) {
+    const completeAddress = await this.#accounts.getAsync(key.toString());
     if (!completeAddress) {
       throw new Error(`Account not found: ${key.toString()}`);
     }
@@ -20,5 +21,6 @@ export class TXEDatabase extends KVPxeDatabase {
 
   async setAccount(key: AztecAddress, value: CompleteAddress) {
     await this.#accounts.set(key.toString(), value.toBuffer());
+    await this.addCompleteAddress(value);
   }
 }

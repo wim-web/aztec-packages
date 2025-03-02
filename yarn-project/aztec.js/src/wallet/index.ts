@@ -1,7 +1,7 @@
-import { type PXE } from '@aztec/circuit-types';
-import { type AztecAddress } from '@aztec/foundation/aztec-address';
+import type { AztecAddress } from '@aztec/stdlib/aztec-address';
+import type { PXE } from '@aztec/stdlib/interfaces/client';
 
-import { type AccountContract } from '../account/contract.js';
+import type { AccountContract } from '../account/contract.js';
 import { AccountWallet } from './account_wallet.js';
 
 export * from '../account/wallet.js';
@@ -21,7 +21,9 @@ export async function getWallet(
   address: AztecAddress,
   accountContract: AccountContract,
 ): Promise<AccountWallet> {
-  const completeAddress = await pxe.getRegisteredAccount(address);
+  const completeAddress = (await pxe.getRegisteredAccounts()).find(completeAddress =>
+    completeAddress.address.equals(address),
+  );
   if (!completeAddress) {
     throw new Error(`Account ${address} not found`);
   }

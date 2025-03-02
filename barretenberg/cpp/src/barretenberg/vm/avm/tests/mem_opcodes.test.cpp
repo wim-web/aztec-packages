@@ -1,6 +1,7 @@
 #include "barretenberg/vm/avm/tests/helpers.test.hpp"
 #include "barretenberg/vm/avm/trace/common.hpp"
 #include "barretenberg/vm/avm/trace/mem_trace.hpp"
+#include "barretenberg/vm/avm/trace/public_inputs.hpp"
 #include "common.test.hpp"
 #include "gtest/gtest.h"
 #include <cstddef>
@@ -21,10 +22,10 @@ class AvmMemOpcodeTests : public ::testing::Test {
         , trace_builder(
               AvmTraceBuilder(public_inputs).set_full_precomputed_tables(false).set_range_check_required(false))
     {
-        srs::init_crs_factory("../srs_db/ignition");
+        srs::init_crs_factory(bb::srs::get_ignition_crs_path());
     }
 
-    VmPublicInputsNT public_inputs;
+    AvmPublicInputs public_inputs;
     AvmTraceBuilder trace_builder;
 
   protected:
@@ -56,7 +57,8 @@ class AvmMemOpcodeTests : public ::testing::Test {
         }
 
         trace_builder.op_mov(indirect ? 3 : 0, src_offset, dst_offset);
-        trace_builder.op_return(0, 0, 0);
+        trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+        trace_builder.op_return(0, 0, 100);
         trace = trace_builder.finalize();
     }
 
@@ -164,10 +166,10 @@ class AvmMemOpcodeTests : public ::testing::Test {
         if (indirect) {
             auto const& mem_ind_a_row = trace.at(mem_ind_a_row_idx);
             EXPECT_THAT(mem_ind_a_row,
-                        AllOf(MEM_ROW_FIELD_EQ(tag_err, 0),
+                        AllOf(MEM_ROW_FIELD_EQ(tag_err, indirect_uninitialized ? 1 : 0),
                               MEM_ROW_FIELD_EQ(r_in_tag, static_cast<uint32_t>(AvmMemoryTag::U32)),
                               MEM_ROW_FIELD_EQ(tag,
-                                               indirect_uninitialized ? static_cast<uint32_t>(AvmMemoryTag::U0)
+                                               indirect_uninitialized ? static_cast<uint32_t>(AvmMemoryTag::FF)
                                                                       : static_cast<uint32_t>(AvmMemoryTag::U32)),
                               MEM_ROW_FIELD_EQ(addr, src_offset),
                               MEM_ROW_FIELD_EQ(val, dir_src_offset),
@@ -218,24 +220,42 @@ TEST_F(AvmMemOpcodeTests, uninitializedValueMov)
 {
     trace_builder.op_set(0, 4, 1, AvmMemoryTag::U32);
     trace_builder.op_mov(0, 0, 1);
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
-    validate_mov_trace(false, 0, 0, 1, AvmMemoryTag::U0);
+    validate_mov_trace(false, 0, 0, 1, AvmMemoryTag::FF);
 }
 
 TEST_F(AvmMemOpcodeTests, indUninitializedValueMov)
 {
-    // TODO(#9131): Re-enable once we have error handling on wrong address resolution
+    // TODO(#9995): Re-enable once we have error handling on wrong address resolution
+    GTEST_SKIP();
+
+    trace_builder.op_set(0, 1, 3, AvmMemoryTag::U32);
+    trace_builder.op_set(0, 4, 1, AvmMemoryTag::U32);
+    trace_builder.op_set(0, 5, 2, AvmMemoryTag::U32);
+    trace_builder.op_mov(3, 2, 3);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
+    trace = trace_builder.finalize();
+
+    validate_mov_trace(true, 0, 2, 3, AvmMemoryTag::FF, 5, 1);
+}
+
+TEST_F(AvmMemOpcodeTests, indUninitializedAddrMov)
+{
+    // TODO(#9995): Re-enable once we have error handling on wrong address resolution
     GTEST_SKIP();
 
     trace_builder.op_set(0, 1, 3, AvmMemoryTag::U32);
     trace_builder.op_set(0, 4, 1, AvmMemoryTag::U32);
     trace_builder.op_mov(3, 2, 3);
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
-    validate_mov_trace(true, 0, 2, 3, AvmMemoryTag::U0, 0, 1, true);
+    validate_mov_trace(true, 0, 2, 3, AvmMemoryTag::FF, 0, 1, true);
 }
 
 TEST_F(AvmMemOpcodeTests, indirectMov)
@@ -249,14 +269,15 @@ TEST_F(AvmMemOpcodeTests, indirectMov)
 
 TEST_F(AvmMemOpcodeTests, indirectMovInvalidAddressTag)
 {
-    // TODO(#9131): Re-enable once we have error handling on wrong address resolution
+    // TODO(#9995): Re-enable once we have error handling on wrong address resolution
     GTEST_SKIP();
 
     trace_builder.op_set(0, 15, 100, AvmMemoryTag::U32);
     trace_builder.op_set(0, 16, 101, AvmMemoryTag::U128); // This will make the indirect load failing.
     trace_builder.op_set(0, 5, 15, AvmMemoryTag::FF);
     trace_builder.op_mov(3, 100, 101);
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
     compute_mov_indices(true);
@@ -278,7 +299,8 @@ TEST_F(AvmMemOpcodeTests, indirectMovInvalidAddressTag)
 TEST_F(AvmMemOpcodeTests, directSet)
 {
     trace_builder.op_set(0, 5683, 99, AvmMemoryTag::U128);
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
     compute_index_c(1, false);
@@ -306,7 +328,8 @@ TEST_F(AvmMemOpcodeTests, indirectSet)
 {
     trace_builder.op_set(0, 100, 10, AvmMemoryTag::U32);
     trace_builder.op_set(1, 1979, 10, AvmMemoryTag::U64); // Set 1979 at memory index 100
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
     // TODO(JEANMON): Turn following boolean to true once we have constraining address resolution
@@ -347,12 +370,13 @@ TEST_F(AvmMemOpcodeTests, indirectSet)
 
 TEST_F(AvmMemOpcodeTests, indirectSetWrongTag)
 {
-    // TODO(#9131): Re-enable once we have error handling on wrong address resolution
+    // TODO(#9995): Re-enable once we have error handling on wrong address resolution
     GTEST_SKIP();
 
     trace_builder.op_set(0, 100, 10, AvmMemoryTag::U8);   // The address 100 has incorrect tag U8.
     trace_builder.op_set(1, 1979, 10, AvmMemoryTag::U64); // Set 1979 at memory index 100
-    trace_builder.op_return(0, 0, 0);
+    trace_builder.op_set(0, 0, 100, AvmMemoryTag::U32);
+    trace_builder.op_return(0, 0, 100);
     trace = trace_builder.finalize();
 
     compute_index_c(2, true);
