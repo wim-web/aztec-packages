@@ -636,8 +636,6 @@ library RelationsLib {
         evals[20] = ep.q_pos_by_scaling * (ep.v3 - wire(p, WIRE.W_O_SHIFT));
 
         evals[21] = ep.q_pos_by_scaling * (ep.v4 - wire(p, WIRE.W_4_SHIFT));
-
-        evals[21] = ep.q_pos_by_scaling * (ep.v4 - wire(p, WIRE.W_4_SHIFT));
     }
 
     struct PoseidonInternalParams {
