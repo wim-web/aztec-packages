@@ -46,7 +46,7 @@ Private state works with UTXOs, which are chunks of data that we call notes. To 
 
 Public state works similarly to other chains like Ethereum, behaving like a public ledger. Public data is stored in a public data tree.
 
-![Public vs private state](../../static/img/public-and-private-state-diagram.png)
+<Image img={require('/img/public-and-private-state-diagram.png')} />
 
 Aztec [smart contract](./smart_contracts_overview.md) developers should keep in mind that different data types are used when manipulating private or public state. Working with private state is creating commitments and nullifiers to state, whereas working with public state is directly updating state.
 

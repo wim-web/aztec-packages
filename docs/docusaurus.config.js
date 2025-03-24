@@ -12,6 +12,14 @@ const path = require("path");
 const fs = require("fs");
 const macros = require("./src/katex-macros.js");
 
+const aztecVersionPath = path.resolve(
+  __dirname,
+  "../.release-please-manifest.json"
+);
+const aztecVersion = JSON.parse(fs.readFileSync(aztecVersionPath).toString())[
+  "."
+];
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Privacy-first zkRollup | Aztec Documentation",
@@ -48,6 +56,12 @@ const config = {
         docs: {
           path: process.env.ENV === "dev" ? "docs" : "processed-docs",
           sidebarPath: "./sidebars.js",
+          lastVersion: "current",
+          versions: {
+            current: {
+              label: aztecVersion.toString(),
+            },
+          },
           editUrl: (params) => {
             return (
               `https://github.com/AztecProtocol/aztec-packages/edit/master/docs/docs/` +
@@ -56,8 +70,8 @@ const config = {
           },
           routeBasePath: "/",
           include: process.env.SHOW_PROTOCOL_SPECS
-            ? ['**/*.{md,mdx}']
-            : ['**/*.{md,mdx}', '!protocol-specs/**'],
+            ? ["**/*.{md,mdx}"]
+            : ["**/*.{md,mdx}", "!protocol-specs/**"],
 
           remarkPlugins: [math],
           rehypePlugins: [
@@ -223,6 +237,10 @@ const config = {
         },
         items: [
           {
+            type: "docsVersionDropdown",
+            position: "right",
+          },
+          {
             type: "doc",
             docId: "aztec/index",
             position: "left",
@@ -305,13 +323,16 @@ const config = {
                 label: "Roadmap",
                 className: "no-external-icon",
               },
-              ...(process.env.SHOW_PROTOCOL_SPECS ?
-              [{
-                type: "docSidebar",
-                sidebarId: "protocolSpecSidebar",
-                label: "Protocol Specification",
-                className: "no-external-icon",
-              }] : []),
+              ...(process.env.SHOW_PROTOCOL_SPECS
+                ? [
+                    {
+                      type: "docSidebar",
+                      sidebarId: "protocolSpecSidebar",
+                      label: "Protocol Specification",
+                      className: "no-external-icon",
+                    },
+                  ]
+                : []),
               {
                 to: "https://noir-lang.org/docs",
                 label: "Noir docs",

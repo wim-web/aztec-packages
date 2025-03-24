@@ -123,8 +123,49 @@ async function run() {
 
   const rootDir = path.join(__dirname, "../../../");
   const docsDir = path.join(rootDir, "docs", "docs");
-  const destDir = path.join(rootDir, "docs", "processed-docs");
-  const cachedDestDir = path.join(rootDir, "docs", "processed-docs-cache");
+
+  // check version tag
+  // if version tag is for testnet, put files in a versioned folder instead of processed-docs
+  const tag = "alpha-testnet"; // process.env.COMMIT_TAG;
+  const isTestnet = tag.includes("alpha-testnet");
+
+  let destDir, cachedDestDir;
+  if (isTestnet) {
+    // process docs and replace with testnet tags
+
+    // remove old versioned docs
+    fs.rmSync(path.join(rootDir, "docs", "versioned_docs"), {
+      recursive: true,
+      force: true,
+    });
+
+    // put new docs in the versioned_docs at the fetched tag
+    destDir = path.join(rootDir, "docs", "versioned_docs", tag);
+
+    // add new tag to versions.json
+    const jsonContent = JSON.stringify([tag], null, 2);
+    fs.writeFileSync("../../versions.json", jsonContent, "utf8");
+
+    // copy sidebars.js to version_sidebars/version-<tag>-sidebars.json
+    const sidebarsContent = fs.readFileSync(
+      path.join(rootDir, "docs", "sidebars.js"),
+      "utf-8"
+    );
+    const versionedSidebarsPath = path.join(
+      rootDir,
+      "docs",
+      "versioned_sidebars",
+      `version-${tag}-sidebars.json`
+    );
+    // TODO: rm existing sidebars files
+    fs.mkdirSync(path.dirname(versionedSidebarsPath), { recursive: true });
+    fs.writeFileSync(versionedSidebarsPath, sidebarsContent, "utf-8");
+
+    fs.cachedDestDir = path.join(rootDir, "docs", "processed-docs-cache");
+  } else {
+    destDir = path.join(rootDir, "docs", "processed-docs");
+    cachedDestDir = path.join(rootDir, "docs", "processed-docs-cache");
+  }
 
   const content = await processMarkdownFilesInDir(rootDir, docsDir);
 

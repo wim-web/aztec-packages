@@ -8,7 +8,7 @@ cmd=${1:-}
 hash=$(
   cache_content_hash \
     .rebuild_patterns \
-    $(find docs -type f -name "*.md" -exec grep '^#include_code' {} \; | \
+    $(find docs -type f -name "*.md" -exec grep '^#include_code' {} \; |
       awk '{ gsub("^/", "", $3); print "^" $3 }' | sort -u)
 )
 
@@ -17,6 +17,8 @@ if semver check $REF_NAME; then
   hash+=$REF_NAME
   export COMMIT_TAG=$REF_NAME
 fi
+
+# add logic for testnet releases
 
 function build_and_preview {
   if [ "${CI:-0}" -eq 1 ] && [ $(arch) == arm64 ]; then
@@ -92,22 +94,23 @@ function release {
 }
 
 case "$cmd" in
-  "clean")
-    git clean -fdx
-    ;;
-  ""|"full"|"fast")
-    build_and_preview
-    ;;
-  "hash")
-    echo "$hash"
-    ;;
-  "release-preview")
-    release_preview
-    ;;
-  "release")
-    release
-    ;;
-  *)
-    echo "Unknown command: $cmd"
-    exit 1
+"clean")
+  git clean -fdx
+  ;;
+"" | "full" | "fast")
+  build_and_preview
+  ;;
+"hash")
+  echo "$hash"
+  ;;
+"release-preview")
+  release_preview
+  ;;
+"release")
+  release
+  ;;
+*)
+  echo "Unknown command: $cmd"
+  exit 1
+  ;;
 esac
