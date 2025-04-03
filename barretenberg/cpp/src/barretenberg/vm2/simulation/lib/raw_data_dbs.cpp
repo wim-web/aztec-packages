@@ -224,6 +224,18 @@ crypto::merkle_tree::GetLowIndexedLeafResponse HintedRawMerkleDB::get_low_indexe
                                         value,
                                         ")"));
     }
+    info("Found low indexed leaf for key (root: ",
+         tree_info.root,
+         ", size: ",
+         tree_info.nextAvailableLeafIndex,
+         ", tree_id: ",
+         static_cast<uint32_t>(tree_id),
+         ", value: ",
+         value,
+         ") -> index: ",
+         it->second.index,
+         ", alreadyPresent: ",
+         it->second.is_already_present);
     return it->second;
 }
 
@@ -250,6 +262,18 @@ crypto::merkle_tree::IndexedLeaf<crypto::merkle_tree::PublicDataLeafValue> Hinte
                                         leaf_index,
                                         ")"));
     }
+    info("Found leaf preimage (PUBLIC_DATA_TREE) for key (root: ",
+         tree_info.root,
+         ", size: ",
+         tree_info.nextAvailableLeafIndex,
+         ", leaf_index: ",
+         leaf_index,
+         ") -> value: ",
+         it->second.value,
+         ", nextIndex: ",
+         it->second.nextIndex,
+         ", nextValue: ",
+         it->second.nextValue);
     return it->second;
 }
 

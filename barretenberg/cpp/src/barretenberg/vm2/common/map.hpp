@@ -1,6 +1,7 @@
 #pragma once
 
-#include "barretenberg/vm2/common/ankerl_dense.hpp"
+// #include "barretenberg/vm2/common/ankerl_dense.hpp"
+#include <unordered_map>
 
 namespace bb::avm2 {
 
@@ -12,8 +13,10 @@ namespace bb::avm2 {
 // https://martin.ankerl.com/2019/04/01/hashmap-benchmarks-01-overview/
 // https://github.com/martinus/robin-hood-hashing is archived and recommends ankerl::unordered_dense.
 // In our benchmarks this map is at least 25% faster for insertion and 2x faster for visits.
-template <class Key, class T> using unordered_flat_map = ::ankerl::unordered_dense::map<Key, T>;
+// template <class Key, class T> using unordered_flat_map = ::ankerl::unordered_dense::map<Key, T>;
 // Note: if we eventually want to have lower memory usage at the cost of some speed,
 // we can use ::ankerl::unordered_dense::segmented_map instead.
+
+template <class Key, class T> using unordered_flat_map = std::unordered_map<Key, T>;
 
 } // namespace bb::avm2

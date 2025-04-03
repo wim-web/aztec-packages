@@ -4,6 +4,7 @@
 
 // TODO(dbanks12): what is Cpp best practice? Import this here or somewhere common/shared?
 // It is needed for uint128_t
+#include "barretenberg/common/utils.hpp"
 #include "barretenberg/numeric/uint128/uint128.hpp"
 
 namespace bb::avm2::simulation {
@@ -15,7 +16,7 @@ struct RangeCheckEvent {
     bool operator==(const RangeCheckEvent& other) const { return value == other.value && num_bits == other.num_bits; }
 
     // To be used with deduplicating event emitters.
-    using Key = std::tuple<uint128_t, uint8_t>;
+    using Key = utils::HashableTuple<uint128_t, uint8_t>;
     Key get_key() const { return { value, num_bits }; }
 };
 

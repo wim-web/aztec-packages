@@ -277,10 +277,13 @@ template <class T> constexpr bool field<T>::operator<(const field& other) const 
 template <class T> constexpr bool field<T>::operator==(const field& other) const noexcept
 {
     BB_OP_COUNT_TRACK_NAME("fr::eqeq");
-    const field left = reduce_once();
-    const field right = other.reduce_once();
-    return (left.data[0] == right.data[0]) && (left.data[1] == right.data[1]) && (left.data[2] == right.data[2]) &&
-           (left.data[3] == right.data[3]);
+    // const field left = reduce_once();
+    // const field right = other.reduce_once();
+    // return (left.data[0] == right.data[0]) && (left.data[1] == right.data[1]) && (left.data[2] == right.data[2]) &&
+    //        (left.data[3] == right.data[3]);
+    auto left = uint256_t(*this);
+    auto right = uint256_t(other);
+    return left == right;
 }
 
 template <class T> constexpr bool field<T>::operator!=(const field& other) const noexcept

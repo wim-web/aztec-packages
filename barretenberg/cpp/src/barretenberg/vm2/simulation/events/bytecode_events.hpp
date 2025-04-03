@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 
+#include "barretenberg/common/utils.hpp"
 #include "barretenberg/vm2/common/aztec_types.hpp"
 #include "barretenberg/vm2/common/field.hpp"
 #include "barretenberg/vm2/common/memory_types.hpp"
@@ -50,7 +51,7 @@ struct InstructionFetchingEvent {
     std::optional<InstrDeserializationError> error;
 
     // To be used with deduplicating event emitters.
-    using Key = std::tuple<BytecodeId, uint32_t>;
+    using Key = utils::HashableTuple<BytecodeId, uint32_t>;
     Key get_key() const { return { bytecode_id, pc }; }
 };
 

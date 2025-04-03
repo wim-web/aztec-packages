@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "barretenberg/common/utils.hpp"
 #include "barretenberg/vm2/common/memory_types.hpp"
 #include "barretenberg/vm2/common/opcodes.hpp"
 
@@ -22,7 +23,7 @@ struct AluEvent {
     // We still might prefer to include tags per operands to simply tracegen...
     MemoryTag tag;
     // To be used with deduplicating event emitters.
-    using Key = std::tuple<AluOperation, MemoryValue, MemoryValue, MemoryValue, MemoryTag>;
+    using Key = utils::HashableTuple<AluOperation, MemoryValue, MemoryValue, MemoryValue, MemoryTag>;
     Key get_key() const { return { operation, a, b, c, tag }; }
 };
 

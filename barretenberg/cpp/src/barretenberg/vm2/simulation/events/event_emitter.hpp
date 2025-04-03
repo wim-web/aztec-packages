@@ -3,6 +3,7 @@
 #include <cassert>
 #include <vector>
 
+#include "barretenberg/common/log.hpp"
 #include "barretenberg/vm2/common/set.hpp"
 
 namespace bb::avm2::simulation {
@@ -42,6 +43,8 @@ template <typename Event> class DeduplicatingEventEmitter : public EventEmitter<
         if (!elements_seen.contains(key)) {
             elements_seen.insert(key);
             EventEmitter<Event>::emit(std::move(event));
+        } else {
+            info("Deduplicated event");
         }
     };
     // Transfers ownership of the events to the caller (clears the internal container).

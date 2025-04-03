@@ -26,7 +26,7 @@ class TraceContainer {
     const FF& get(Column col, uint32_t row) const;
     template <size_t N> std::array<FF, N> get_multiple(const std::array<ColumnAndShifts, N>& cols, uint32_t row) const
     {
-        std::array<FF, N> result;
+        std::array<FF, N> result = {};
         for (size_t i = 0; i < N; ++i) {
             if (!is_shift(cols[i])) {
                 result[i] = get(static_cast<Column>(cols[i]), row);

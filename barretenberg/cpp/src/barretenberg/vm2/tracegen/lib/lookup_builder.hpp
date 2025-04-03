@@ -77,7 +77,7 @@ class LookupIntoDynamicTableGeneric : public BaseLookupTraceBuilder<LookupSettin
         if (it != row_idx.end()) {
             return it->second;
         }
-        throw std::runtime_error("Failed computing counts for " + std::string(LookupSettings::NAME) +
+        throw std::runtime_error("[GENERIC] Failed computing counts for " + std::string(LookupSettings::NAME) +
                                  ". Could not find tuple in destination.");
     }
 
@@ -124,7 +124,7 @@ template <typename LookupSettings> class LookupIntoDynamicTableSequential : publ
                 ++dst_row;
             }
 
-            throw std::runtime_error("Failed computing counts for " + std::string(LookupSettings::NAME) +
+            throw std::runtime_error("[SEQUENTIAL] Failed computing counts for " + std::string(LookupSettings::NAME) +
                                      ". Could not find tuple in destination.");
         });
     }
@@ -136,11 +136,8 @@ template <typename LookupSettings> class LookupIntoDynamicTableSequential : publ
 template <typename T, size_t SIZE> struct std::hash<std::array<T, SIZE>> {
     std::size_t operator()(const std::array<T, SIZE>& arr) const noexcept
     {
-        std::size_t hash = 0;
-        for (const auto& elem : arr) {
-            hash = std::rotl(hash, 1);
-            hash ^= std::hash<T>{}(elem);
-        }
-        return hash;
+        return [&arr]<size_t... Is>(std::index_sequence<Is...>) {
+            return bb::utils::hash_as_tuple(arr[Is]...);
+        }(std::make_index_sequence<SIZE>{});
     }
 };
