@@ -51,7 +51,9 @@ import { type BlockHeader, type IndexedTxEffect, TxHash, TxReceipt } from '@azte
 import { Attributes, type TelemetryClient, type Traceable, type Tracer, trackSpan } from '@aztec/telemetry-client';
 
 import { EventEmitter } from 'events';
+import { mkdir } from 'fs/promises';
 import groupBy from 'lodash.groupby';
+import { join } from 'path';
 import { type GetContractReturnType, createPublicClient, fallback, getContract, http } from 'viem';
 
 import type { ArchiverDataStore, ArchiverL1SynchPoint } from './archiver_store.js';
@@ -66,6 +68,8 @@ import type { PublishedL2Block } from './structs/published.js';
  * Helper interface to combine all sources this archiver implementation provides.
  */
 export type ArchiveSource = L2BlockSource & L2LogsSource & ContractDataSource & L1ToL2MessageSource;
+
+const REORG_ARCHIVE_DIR = process.env.REORG_ARCHIVE_DIR;
 
 /**
  * Pulls L2 blocks in a non-blocking manner and provides interface for their retrieval.
@@ -333,6 +337,22 @@ export class Archiver extends EventEmitter implements ArchiveSource, Traceable {
 
       const pruneFromSlotNumber = header.globalVariables.slotNumber.toBigInt();
       const pruneFromEpochNumber = getEpochAtSlot(pruneFromSlotNumber, this.l1constants);
+
+      if (REORG_ARCHIVE_DIR) {
+        try {
+          const pendingHeader = await this.getBlockHeader(Number(localPendingBlockNumber));
+          const path = join(
+            REORG_ARCHIVE_DIR,
+            'reorg_archive',
+            `${localPendingBlockNumber}_${pendingHeader!.hash().toString()}`,
+            'archiver',
+          );
+          await mkdir(path, { recursive: true });
+          await this.backupTo(path);
+        } catch (err) {
+          this.log.warn('Failed to backup archiver data before reorging', { err });
+        }
+      }
 
       // Emit an event for listening services to react to the chain prune
       this.emit(L2BlockSourceEvents.L2PruneDetected, {

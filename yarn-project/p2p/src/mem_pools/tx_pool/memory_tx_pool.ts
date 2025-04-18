@@ -171,4 +171,8 @@ export class InMemoryTxPool implements TxPool {
   public getAllTxHashes(): Promise<TxHash[]> {
     return Promise.resolve(Array.from(this.txs.keys()).map(x => TxHash.fromBigInt(x)));
   }
+
+  backupTo(_dir: string): Promise<void> {
+    return Promise.resolve();
+  }
 }

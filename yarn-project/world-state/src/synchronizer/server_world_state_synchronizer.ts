@@ -27,12 +27,17 @@ import type { L2BlockHandledStats } from '@aztec/stdlib/stats';
 import { MerkleTreeId, type MerkleTreeReadOperations, type MerkleTreeWriteOperations } from '@aztec/stdlib/trees';
 import { TraceableL2BlockStream, getTelemetryClient } from '@aztec/telemetry-client';
 
+import { mkdir } from 'fs/promises';
+import { join } from 'path';
+
 import { WorldStateInstrumentation } from '../instrumentation/instrumentation.js';
 import type { WorldStateStatusFull } from '../native/message.js';
 import type { MerkleTreeAdminDatabase } from '../world-state-db/merkle_tree_db.js';
 import type { WorldStateConfig } from './config.js';
 
 export type { SnapshotDataKeys };
+
+const REORG_ARCHIVE_DIR = process.env.REORG_ARCHIVE_DIR;
 
 /**
  * Synchronizes the world state with the L2 blocks from a L2BlockSource via a block stream.
@@ -244,7 +249,7 @@ export class ServerWorldStateSynchronizer
         await this.handleL2Blocks(event.blocks.map(b => b.block));
         break;
       case 'chain-pruned':
-        await this.handleChainPruned(event.block.number);
+        await this.handleChainPruned(event.block.number, event.block.hash!);
         break;
       case 'chain-proven':
         await this.handleChainProven(event.block.number);
@@ -334,8 +339,17 @@ export class ServerWorldStateSynchronizer
     return Promise.resolve();
   }
 
-  private async handleChainPruned(blockNumber: number) {
+  private async handleChainPruned(blockNumber: number, hash: string) {
     this.log.warn(`Chain pruned to block ${blockNumber}`);
+    if (REORG_ARCHIVE_DIR) {
+      try {
+        const path = join(REORG_ARCHIVE_DIR, 'reorg_archive', `${blockNumber}_${hash}`, 'world_state');
+        await mkdir(path, { recursive: true });
+        await this.merkleTreeDb.backupTo(path);
+      } catch (err) {
+        this.log.warn('Failed to backup worldstate data before reorging', { err });
+      }
+    }
     const status = await this.merkleTreeDb.unwindBlocks(BigInt(blockNumber));
     this.latestBlockHashQuery = undefined;
     this.instrumentation.updateWorldStateMetrics(status);

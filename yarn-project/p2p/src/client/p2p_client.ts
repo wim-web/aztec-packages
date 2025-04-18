@@ -23,6 +23,8 @@ import {
 } from '@aztec/telemetry-client';
 
 import type { ENR } from '@chainsafe/enr';
+import { mkdir } from 'fs/promises';
+import { join } from 'path';
 
 import { type P2PConfig, getP2PDefaultConfig } from '../config.js';
 import type { AttestationPool } from '../mem_pools/attestation_pool/attestation_pool.js';
@@ -169,6 +171,8 @@ export type P2P<T extends P2PClientType = P2PClientType.Full> = ProverCoordinati
     isP2PClient(): true;
   };
 
+const REORG_ARCHIVE_DIR = process.env.REORG_ARCHIVE_DIR;
+
 /**
  * The P2P client implementation.
  */
@@ -301,7 +305,7 @@ export class P2PClient<T extends P2PClientType = P2PClientType.Full>
         break;
       }
       case 'chain-pruned':
-        await this.handlePruneL2Blocks(event.block.number);
+        await this.handlePruneL2Blocks(event.block.number, event.block.hash!);
         break;
       default: {
         const _: never = event;
@@ -731,7 +735,17 @@ export class P2PClient<T extends P2PClientType = P2PClientType.Full>
    * Updates the tx pool after a chain prune.
    * @param latestBlock - The block number the chain was pruned to.
    */
-  private async handlePruneL2Blocks(latestBlock: number): Promise<void> {
+  private async handlePruneL2Blocks(latestBlock: number, hash: string): Promise<void> {
+    if (REORG_ARCHIVE_DIR) {
+      try {
+        const path = join(REORG_ARCHIVE_DIR, 'reorg_archive', `${latestBlock}_${hash}`, 'p2p');
+        await mkdir(path, { recursive: true });
+        await this.txPool.backupTo(path);
+      } catch (err) {
+        this.log.warn('Failed to backup p2p data before reorging', { err });
+      }
+    }
+
     const txsToDelete: TxHash[] = [];
     for (const tx of await this.txPool.getAllTxs()) {
       // every tx that's been generated against a block that has now been pruned is no longer valid

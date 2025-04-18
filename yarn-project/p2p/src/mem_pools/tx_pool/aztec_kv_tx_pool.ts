@@ -242,6 +242,7 @@ export class AztecKVTxPool implements TxPool {
     const hashesAndStats = await Promise.all(
       txs.map(async tx => ({ txHash: await tx.getTxHash(), txStats: await tx.getStats() })),
     );
+    this.#log.debug('Hashes and stats', { hashesAndStats });
     await this.#store.transactionAsync(async () => {
       let pendingCount = 0;
       let pendingTxSize = (await this.#pendingTxSize.getAsync()) ?? 0;
@@ -584,5 +585,9 @@ export class AztecKVTxPool implements TxPool {
     await this.#pendingTxHashToSize.delete(txHash);
     await this.#pendingTxHashToHeaderHash.delete(txHash);
     this.#pendingTxs.delete(txHash);
+  }
+
+  backupTo(dir: string): Promise<void> {
+    return this.#store.backupTo(dir);
   }
 }
