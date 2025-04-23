@@ -349,7 +349,7 @@ async function setupFromFresh(
 
   const initialFundedAccounts = await generateSchnorrAccounts(numberOfInitialFundedAccounts);
   const sponsoredFPCAddress = await getSponsoredFPCAddress();
-  const { genesisArchiveRoot, genesisBlockHash, prefilledPublicData, fundingNeeded } = await getGenesisValues(
+  const { genesisArchiveRoot, prefilledPublicData, fundingNeeded } = await getGenesisValues(
     initialFundedAccounts.map(a => a.address).concat(sponsoredFPCAddress),
     opts.initialAccountFeeJuice,
   );
@@ -357,7 +357,6 @@ async function setupFromFresh(
   const deployL1ContractsValues = await setupL1Contracts(aztecNodeConfig.l1RpcUrls[0], hdAccount, logger, {
     ...getL1ContractsConfigEnvVars(),
     genesisArchiveRoot,
-    genesisBlockHash,
     feeJuicePortalInitialBalance: fundingNeeded,
     salt: opts.salt,
     ...deployL1ContractsArgs,
