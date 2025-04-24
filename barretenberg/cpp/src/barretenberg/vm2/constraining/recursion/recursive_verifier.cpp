@@ -131,11 +131,11 @@ AvmRecursiveVerifier_<Flavor>::PairingPoints AvmRecursiveVerifier_<Flavor>::veri
     std::vector<FF> mle_challenge(output.challenge.begin(),
                                   output.challenge.begin() + static_cast<int>(log_circuit_size));
 
-    // Simplified public input with a single column
-    // TODO: Extend to multiple columns once public inputs are finalized
-    FF execution_input_evaluation = evaluate_public_input_column(public_inputs[0], mle_challenge);
-    execution_input_evaluation.assert_equal(output.claimed_evaluations.execution_input,
-                                            "execution_input_evaluation failed");
+    for (size_t i = 0; i < AVM_NUM_PUBLIC_INPUT_COLUMNS; i++) {
+        FF execution_input_evaluation = evaluate_public_input_column(public_inputs[i], mle_challenge);
+        execution_input_evaluation.assert_equal(output.claimed_evaluations.execution_input,
+                                                "execution_input_evaluation failed");
+    }
 
     // Execute Shplemini rounds.
     ClaimBatcher claim_batcher{
