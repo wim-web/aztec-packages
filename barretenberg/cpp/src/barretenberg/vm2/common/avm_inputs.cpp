@@ -28,11 +28,12 @@ std::vector<std::vector<FF>> PublicInputs::to_columns() const
                                       std::vector<FF>(AVM_PUBLIC_INPUTS_COLUMNS_MAX_LENGTH));
 
     // TODO(dbanks12): globalsVariables
-    cols[0][AVM_PUBLIC_INPUTS_GLOBAL_VARIABLES_ROW_IDX] = globalVariables.blockNumber;
+    cols[0][AVM_PUBLIC_INPUTS_GLOBAL_VARIABLES_BLOCK_NUMBER_ROW_IDX] = globalVariables.blockNumber;
 
     // start tree snapshots
-    cols[0][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_ROW_IDX] = startTreeSnapshots.l1ToL2MessageTree.root;
-    cols[1][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_ROW_IDX] =
+    cols[0][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_L1_TO_L2_MESSAGE_TREE_ROW_IDX] =
+        startTreeSnapshots.l1ToL2MessageTree.root;
+    cols[1][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_L1_TO_L2_MESSAGE_TREE_ROW_IDX] =
         startTreeSnapshots.l1ToL2MessageTree.nextAvailableLeafIndex;
     cols[0][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_NOTE_HASH_TREE_ROW_IDX] = startTreeSnapshots.noteHashTree.root;
     cols[1][AVM_PUBLIC_INPUTS_START_TREE_SNAPSHOTS_NOTE_HASH_TREE_ROW_IDX] =
