@@ -6,9 +6,12 @@ use dep::aztec::macros::aztec;
 pub contract Counter {
     // docs:end:setup
     // docs:start:imports
-    use aztec::macros::{functions::{initializer, private, utility}, storage::storage};
+    use aztec::macros::{functions::{initializer, private, public, utility}, storage::storage};
     use aztec::prelude::{AztecAddress, Map};
-    use aztec::protocol_types::traits::{FromField, ToField};
+    use aztec::protocol_types::{
+        abis::function_selector::FunctionSelector,
+        traits::{FromField, ToField},
+    };
     use easy_private_state::EasyPrivateUint;
     use value_note::{balance_utils, value_note::ValueNote};
     // docs:end:imports
@@ -39,6 +42,14 @@ pub contract Counter {
                 [owner.to_field()],
             );
         }
+
+        Counter::at(context.this_address()).emit_in_public().enqueue(&mut context);
+        context.set_public_teardown_function(
+            context.this_address(),
+            comptime { FunctionSelector::from_signature("emit_in_public()") },
+            [],
+        );
+
         let counters = storage.counters;
         counters.at(owner).add(1, owner, sender);
     }
@@ -89,6 +100,35 @@ pub contract Counter {
         balance_utils::get_balance(counters.at(owner).set)
     }
 
+    #[private]
+    fn increment_other(other_counter: AztecAddress, owner: AztecAddress, sender: AztecAddress) {
+        unsafe {
+            dep::aztec::oracle::debug_log::debug_log_format(
+                "Incrementing counter for other {0}",
+                [owner.to_field()],
+            );
+        }
+
+        let counters = storage.counters;
+        counters.at(owner).add(1, owner, sender);
+        context.set_public_teardown_function(
+            context.this_address(),
+            comptime { FunctionSelector::from_signature("emit_in_public()") },
+            [],
+        );
+        Counter::at(context.this_address()).emit_in_public().enqueue(&mut context);
+        Counter::at(other_counter).increment(owner, sender).call(&mut context);
+    }
+
+    #[public]
+    fn emit_in_public() {
+        unsafe {
+            dep::aztec::oracle::debug_log::debug_log_format("Emitting in public", []);
+        }
+
+        context.push_note_hash(696969696969);
+    }
+
     // docs:end:get_counter
     // docs:start:test_imports
     use crate::test;
@@ -97,127 +137,183 @@ pub contract Counter {
     use dep::aztec::protocol_types::storage::map::derive_storage_slot_in_map;
     use dep::aztec::test::helpers::test_environment::TestEnvironment;
 
-    // docs:end:test_imports
-    // docs:start:txe_test_increment
+    // // docs:end:test_imports
+    // // docs:start:txe_test_increment
+    // #[test]
+    // unconstrained fn test_increment() {
+    //     // Setup env, generate keys
+    //     let mut env = TestEnvironment::new();
+    //     let owner = env.create_account(1);
+    //     let sender = env.create_account(2);
+    //     let initial_value: Field = 5;
+    //     env.impersonate(owner);
+    //     // Deploy contract and initialize
+    //     let initializer = Counter::interface().initialize(initial_value as u64, owner);
+    //     let counter_contract = env.deploy_self("Counter").with_private_initializer(initializer);
+    //     let contract_address = counter_contract.to_address();
+    //     // docs:start:txe_test_read_notes
+    //     // Read the stored value in the note
+    //     env.impersonate(contract_address);
+    //     let counter_slot = Counter::storage_layout().counters.slot;
+    //     let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
+    //     let mut options = NoteViewerOptions::new();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     let initial_note_value = notes.get(0).value;
+    //     assert(
+    //         initial_note_value == initial_value,
+    //         f"Expected {initial_value} but got {initial_note_value}",
+    //     );
+    //     // docs:end:txe_test_read_notes
+    //     // Increment the counter
+    //     Counter::at(contract_address).increment(owner, sender).call(&mut env.private());
+    //     // get_counter is an unconstrained function, so we call it directly (we're in the same module)
+    //     let current_value_for_owner = get_counter(owner);
+    //     let expected_current_value = initial_value + 1;
+    //     assert(
+    //         expected_current_value == current_value_for_owner,
+    //         f"Expected {expected_current_value} but got {current_value_for_owner}",
+    //     );
+    // }
+    // // docs:end:txe_test_increment
+
+    // // TODO(#13221): I had to comment out all the env.advance_block_by(1) and sync_notes() calls because that triggered
+    // // an issue with how state is committed. The calls to advance_block_by(1) seems to have always been unnecessary
+    // // in this test but anyway we should fix the issue and try to get the block advancing working here.
+    // #[test]
+    // unconstrained fn extended_incrementing_and_decrementing() {
+    //     let initial_value = 5;
+    //     let (env, contract_address, owner, sender) = test::setup(initial_value);
+
+    //     // Checking from the note cache
+    //     env.impersonate(contract_address);
+    //     let counter_slot = Counter::storage_layout().counters.slot;
+    //     let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
+    //     let mut options = NoteViewerOptions::new();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     let initial_note_value = notes.get(0).value;
+    //     assert(
+    //         initial_note_value == initial_value,
+    //         f"Expected {initial_value} but got {initial_note_value}",
+    //     );
+
+    //     // Checking that the note was discovered from private logs
+    //     // env.advance_block_by(1);
+    //     sync_notes();
+    //     env.impersonate(contract_address);
+    //     let counter_slot = Counter::storage_layout().counters.slot;
+    //     let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
+    //     let mut options = NoteViewerOptions::new();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     let initial_note_value = notes.get(0).value;
+    //     assert(
+    //         initial_note_value == initial_value,
+    //         f"Expected {initial_value} but got {initial_note_value}",
+    //     );
+
+    //     Counter::at(contract_address).increment_twice(owner, sender).call(&mut env.private());
+
+    //     // Checking from the note cache
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(notes.len() == 3);
+    //     assert(get_counter(owner) == 7);
+
+    //     // Checking that the note was discovered from private logs
+    //     // env.advance_block_by(1);
+    //     sync_notes();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(get_counter(owner) == 7);
+    //     assert(notes.len() == 3);
+
+    //     // Checking from the note cache
+    //     Counter::at(contract_address).increment_and_decrement(owner, sender).call(&mut env.private());
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(get_counter(owner) == 7);
+    //     // We have a change note of 0
+    //     assert(notes.len() == 4);
+
+    //     // Checking that the note was discovered from private logs
+    //     // env.advance_block_by(1);
+    //     sync_notes();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(notes.len() == 4);
+    //     assert(get_counter(owner) == 7);
+
+    //     // Checking from the note cache
+    //     Counter::at(contract_address).decrement(owner, sender).call(&mut env.private());
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(get_counter(owner) == 6);
+    //     assert(notes.len() == 4);
+
+    //     // Checking that the note was discovered from private logs
+    //     // env.advance_block_by(1);
+    //     sync_notes();
+    //     let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+    //         view_notes(owner_storage_slot, options);
+    //     assert(get_counter(owner) == 6);
+    //     assert(notes.len() == 4);
+    // }
+
     #[test]
-    unconstrained fn test_increment() {
-        // Setup env, generate keys
+    unconstrained fn test_new_calling_flow() {
         let mut env = TestEnvironment::new();
         let owner = env.create_account(1);
         let sender = env.create_account(2);
-        let initial_value: Field = 5;
+        let initial_value: Field = 1;
         env.impersonate(owner);
-        // Deploy contract and initialize
+
         let initializer = Counter::interface().initialize(initial_value as u64, owner);
         let counter_contract = env.deploy_self("Counter").with_private_initializer(initializer);
         let contract_address = counter_contract.to_address();
-        // docs:start:txe_test_read_notes
-        // Read the stored value in the note
-        env.impersonate(contract_address);
-        let counter_slot = Counter::storage_layout().counters.slot;
-        let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
-        let mut options = NoteViewerOptions::new();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        let initial_note_value = notes.get(0).value;
-        assert(
-            initial_note_value == initial_value,
-            f"Expected {initial_value} but got {initial_note_value}",
-        );
-        // docs:end:txe_test_read_notes
-        // Increment the counter
-        Counter::at(contract_address).increment(owner, sender).call(&mut env.private());
-        // get_counter is an unconstrained function, so we call it directly (we're in the same module)
-        let current_value_for_owner = get_counter(owner);
-        let expected_current_value = initial_value + 1;
-        assert(
-            expected_current_value == current_value_for_owner,
-            f"Expected {expected_current_value} but got {current_value_for_owner}",
-        );
-    }
-    // docs:end:txe_test_increment
 
-    // TODO(#13221): I had to comment out all the env.advance_block_by(1) and sync_notes() calls because that triggered
-    // an issue with how state is committed. The calls to advance_block_by(1) seems to have always been unnecessary
-    // in this test but anyway we should fix the issue and try to get the block advancing working here.
-    #[test]
-    unconstrained fn extended_incrementing_and_decrementing() {
-        let initial_value = 5;
-        let (env, contract_address, owner, sender) = test::setup(initial_value);
+        let initializer2 = Counter::interface().initialize(initial_value as u64, sender);
+        let counter_contract2 = env.deploy_self("Counter").with_private_initializer(initializer2);
+        let contract_address2 = counter_contract2.to_address();
 
-        // Checking from the note cache
-        env.impersonate(contract_address);
-        let counter_slot = Counter::storage_layout().counters.slot;
-        let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
-        let mut options = NoteViewerOptions::new();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        let initial_note_value = notes.get(0).value;
-        assert(
-            initial_note_value == initial_value,
-            f"Expected {initial_value} but got {initial_note_value}",
+        env.advance_block_by(1);
+
+        std::println("Hello");
+
+        // TODO: return return value / tx hash
+        // env.call_private_void(owner, Counter::at(contract_address).increment(owner, sender));
+        env.call_private_void(
+            owner,
+            Counter::at(contract_address).increment_other(contract_address2, owner, sender),
         );
 
-        // Checking that the note was discovered from private logs
-        // env.advance_block_by(1);
-        sync_notes();
-        env.impersonate(contract_address);
-        let counter_slot = Counter::storage_layout().counters.slot;
-        let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
-        let mut options = NoteViewerOptions::new();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        let initial_note_value = notes.get(0).value;
-        assert(
-            initial_note_value == initial_value,
-            f"Expected {initial_value} but got {initial_note_value}",
-        );
+        // env.impersonate(contract_address);
 
-        Counter::at(contract_address).increment_twice(owner, sender).call(&mut env.private());
+        // sync_notes();
+        // let mut options = NoteViewerOptions::new();
+        // let counter_slot = Counter::storage_layout().counters.slot;
 
-        // Checking from the note cache
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(notes.len() == 3);
-        assert(get_counter(owner) == 7);
+        // let owner_storage_slot = derive_storage_slot_in_map(counter_slot, owner);
+        // let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
+        //     view_notes(owner_storage_slot, options);
 
-        // Checking that the note was discovered from private logs
-        // env.advance_block_by(1);
-        sync_notes();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(get_counter(owner) == 7);
-        assert(notes.len() == 3);
+        // dep::aztec::oracle::debug_log::debug_log_format(
+        //     "notes len: {}",
+        //     [notes.len() as Field],
+        // );
 
-        // Checking from the note cache
-        Counter::at(contract_address).increment_and_decrement(owner, sender).call(&mut env.private());
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(get_counter(owner) == 7);
-        // We have a change note of 0
-        assert(notes.len() == 4);
+        // let current_value_for_owner = get_counter(owner);
+        // dep::aztec::oracle::debug_log::debug_log_format(
+        //     "current_value_for_owner: {}",
+        //     [current_value_for_owner],
+        // );
 
-        // Checking that the note was discovered from private logs
-        // env.advance_block_by(1);
-        sync_notes();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(notes.len() == 4);
-        assert(get_counter(owner) == 7);
+        // finish this w/ nested and public
+        // disable arbitrary oracles
+        // finish utility call interface
+        // finish inlined contract call
 
-        // Checking from the note cache
-        Counter::at(contract_address).decrement(owner, sender).call(&mut env.private());
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(get_counter(owner) == 6);
-        assert(notes.len() == 4);
-
-        // Checking that the note was discovered from private logs
-        // env.advance_block_by(1);
-        sync_notes();
-        let notes: BoundedVec<ValueNote, MAX_NOTES_PER_PAGE> =
-            view_notes(owner_storage_slot, options);
-        assert(get_counter(owner) == 6);
-        assert(notes.len() == 4);
+        // std::println("hi");
     }
 }

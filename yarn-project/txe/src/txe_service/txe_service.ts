@@ -826,4 +826,23 @@ export class TXEService {
     const success = (this.typedOracle as TXE).avmOpcodeSuccessCopy();
     return toForeignCallResult([toSingle(new Fr(success))]);
   }
+
+  async privateCallNewFlow(
+    from: ForeignCallSingle,
+    targetContractAddress: ForeignCallSingle,
+    functionSelector: ForeignCallSingle,
+    argsHash: ForeignCallSingle,
+    sideEffectCounter: ForeignCallSingle,
+    isStaticCall: ForeignCallSingle,
+  ) {
+    const result = await (this.typedOracle as TXE).privateCallNewFlow(
+      addressFromSingle(from),
+      addressFromSingle(targetContractAddress),
+      FunctionSelector.fromField(fromSingle(functionSelector)),
+      fromSingle(argsHash),
+      fromSingle(sideEffectCounter).toNumber(),
+      fromSingle(isStaticCall).toBool(),
+    );
+    return toForeignCallResult([toArray([result.endSideEffectCounter, result.returnsHash])]);
+  }
 }
