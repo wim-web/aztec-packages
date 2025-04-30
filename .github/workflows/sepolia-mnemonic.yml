@@ -1,0 +1,91 @@
+name: Aztec Network Deployment
+
+on:
+  workflow_call:
+    inputs:
+      mnemonic_secret_name:
+        description: The name of the secret which holds the mnemonic
+        required: true
+        type: string
+        default:
+      address_count:
+        description: How many addresses to fund
+        required: true
+        type: number
+        default: 10
+    secrets:
+      GCP_SA_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      mnemonic_secret_name:
+        description: The name of the secret which holds the mnemonic
+        required: true
+      address_count:
+        description: How many addresses to fund
+        required: true
+        default: 10
+jobs:
+  network_deployment:
+    # This job will run on Ubuntu
+    runs-on: ubuntu-latest
+    concurrency:
+      group: sepolia-mnemonic-${{ github.ref }} # Only one job per branch
+      cancel-in-progress: false # Allow previous deployment to complete to avoid corruption
+
+    # Set up a variable based on the branch name
+    env:
+      MNEMONIC_SECRET_NAME: ${{ inputs.mnemonic_secret_name }}
+      ADDRESS_COUNT: ${{ inputs.address_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install cast
+        run: |
+          if ! command -v cast &>/dev/null; then
+            echo "Installing cast..."
+            curl -L https://foundry.paradigm.xyz | bash
+            $HOME/.foundry/bin/foundryup
+          fi
+
+
+      - name: Get or generate the mnemonic
+        id: mnemonic
+        run: |
+          mnemonic_filename=$(mktemp)
+          if gcloud secrets describe "$MNEMONIC_SECRET_NAME" &>/dev/null; then
+            echo "Mnemonic $MNEMONIC_SECRET_NAME exists"
+            gcloud secrets versions access latest --secret=$MNEMONIC_SECRET_NAME --out-file=$mnemonic_filename
+          else
+            echo "Creating mnemonic..."
+            cast wallet new-mnemonic --json > "$mnemonic_filename"
+
+            gcloud secrets create "$MNEMONIC_SECRET_NAME" \
+              --replication-policy="automatic" \
+              --data-file=$mnemonic_filename
+            echo "New mnemonic saved to $MNEMONIC_SECRET_NAME"
+          fi
+
+          echo "mnemonic_filename=$mnemonic_filename" >> "$GITHUB_OUTPUT"
+
+      - name: Generate sepolia accounts
+        id: generate-sepolia-accounts
+        run: |
+          REPO=$(git rev-parse --show-toplevel)
+          export FUNDING_PRIVATE_KEY=${{ secrets.SEPOLIA_FUNDING_PRIVATE_KEY }}
+          export ETHEREUM_HOST="https://json-rpc.${{ secrets.GCP_SEPOLIA_URL }}?key=${{ secrets.GCP_SEPOLIA_API_KEY }}"
+          # TODO read mnemonic from tmp file and fund
+          MNEMONIC_FILE=$(mktemp)
+          $REPO/spartan/scripts/prepare_sepolia_accounts.sh ${{ env.VALUES_FILE }} 30 "$MNEMONIC_FILE"
